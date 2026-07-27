@@ -1,0 +1,5 @@
+*.log
+*.temp.mkv
+*.remux.temp.mkv
+_logs/
+_work/
