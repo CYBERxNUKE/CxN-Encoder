@@ -17,6 +17,11 @@ $VideoProfileArgs = if ($Codec -eq "x265") {
 } else {
     @("-profile:v", "high")
 }
+$VideoFilterArgs = if ($Codec -eq "x265") {
+    @("-vf", "scale_cuda=format=p010le:passthrough=0", "-noautoscale")
+} else {
+    @("-vf", "scale_cuda=format=nv12:passthrough=0", "-noautoscale")
+}
 
 # --- ENVIRONMENT RELOAD ---
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
@@ -747,6 +752,7 @@ while ($true) {
                 "-multipass", "2",
                 "-c:a", "copy"
             )
+            $ffmpegArgs += $VideoFilterArgs
             $ffmpegArgs += $VideoProfileArgs
             Add-SubtitleStreamArgs -Args ([ref]$ffmpegArgs) -Info $Info
             $ffmpegArgs += @(
@@ -860,6 +866,7 @@ while ($true) {
                 "-multipass", "2",
                 "-c:a", "copy"
             )
+            $ffmpegArgs += $VideoFilterArgs
             $ffmpegArgs += $VideoProfileArgs
             if (-not $UseMKVMergeForSubtitleRemux) {
                 Add-SubtitleStreamArgs -Args ([ref]$ffmpegArgs) -Info $Info
@@ -981,6 +988,7 @@ while ($true) {
             "-multipass", "2",
             "-c:a", "copy"
         )
+        $ffmpegArgs += $VideoFilterArgs
         $ffmpegArgs += $VideoProfileArgs
         if (-not $UseMKVMergeForSubtitleRemux) {
             Add-SubtitleStreamArgs -Args ([ref]$ffmpegArgs) -Info $Info

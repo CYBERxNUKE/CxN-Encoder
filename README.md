@@ -50,6 +50,11 @@ For H.265/HEVC:
 
 The console title is `CxN-Encoder x265`, and FFmpeg uses `hevc_nvenc`.
 
+Both encoder modes normalize decoded frames with `scale_cuda` before NVENC and
+disable FFmpeg's automatic output scaler. This keeps format and color-property
+changes inside the GPU path instead of inserting an incompatible software
+scaler mid-encode.
+
 ## Important behavior
 
 CxN-Encoder is an automated media mover as well as an encoder. After a
