@@ -1,3 +1,10 @@
-$engine = Join-Path $PSScriptRoot "CxN-Encoder.ps1"
-& $engine -Codec "x264"
-exit $LASTEXITCODE
+param([switch]$Headless)
+
+$entryPoint = Join-Path $PSScriptRoot "CxN-Encoder.ps1"
+if ($Headless) {
+    & $entryPoint -Codec "x264"
+} else {
+    $launcher = Join-Path $PSScriptRoot "CxN-Encoder-GUI-Launcher.vbs"
+    Start-Process -FilePath "$env:SystemRoot\System32\wscript.exe" -ArgumentList @('//nologo', ('"' + $launcher + '"'), 'x264') -WindowStyle Hidden | Out-Null
+}
+exit $(if ($Headless) { $LASTEXITCODE } else { 0 })

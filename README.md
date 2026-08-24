@@ -34,21 +34,40 @@ on another computer.
 
 ## Run
 
-For H.264:
+For H.264, open the GUI with H.264 selected:
 
 ```powershell
 .\x264-folder-encoder.ps1
 ```
 
-The console title is `CxN-Encoder x264`, and FFmpeg uses `h264_nvenc`.
-
-For H.265/HEVC:
+For H.265/HEVC, open the GUI with H.265 selected:
 
 ```powershell
 .\x265-folder-encoder.ps1
 ```
 
-The console title is `CxN-Encoder x265`, and FFmpeg uses `hevc_nvenc`.
+The GUI opens without a shell window and runs the encoder in a separate hidden
+process, so the window remains responsive and the encoder retains full NVENC
+throughput. It displays the current file, media details, percentage, elapsed
+time, speed, ETA, last output, and live encoder messages. Minimize the window to
+keep it in the Windows notification area. Use its tray menu or double-click the
+tray icon to restore it.
+
+Pause suspends the active FFmpeg process and Resume continues it. Stop prompts
+for one of three choices: stop now and return the active source with temporary
+output cleaned up, finish the current file and then stop, or cancel the stop.
+
+The shared engine handles both stop modes and removes its progress, stdout,
+stderr, and encode temp files when a stop-now request returns the source.
+
+To use the original console-only service, add `-Headless`:
+
+```powershell
+.\x265-folder-encoder.ps1 -Headless
+.\x264-folder-encoder.ps1 -Headless
+```
+
+H.264 uses `h264_nvenc`; H.265 uses `hevc_nvenc`.
 
 Both encoder modes normalize decoded frames with `scale_cuda` before NVENC and
 disable FFmpeg's automatic output scaler. This keeps format and color-property
@@ -62,4 +81,4 @@ successful encode or move, it removes the processed source and empty source
 folders. Test with disposable files and verify every configured path before
 using it with a media library.
 
-Stop the continuous monitoring loop with `Ctrl+C`.
+Stop a headless monitoring loop with `Ctrl+C`.

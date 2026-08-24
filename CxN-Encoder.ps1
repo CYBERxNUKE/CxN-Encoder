@@ -2,7 +2,11 @@
 param(
     [Parameter(Mandatory=$true)]
     [ValidateSet("x264", "x265")]
-    [string]$Codec
+    [string]$Codec,
+
+    [string]$StopSignalPath = "",
+
+    [string]$PauseSignalPath = ""
 )
 
 # Shared CxN-Encoder engine for movies and series
@@ -21,6 +25,21 @@ $VideoFilterArgs = if ($Codec -eq "x265") {
     @("-vf", "scale_cuda=format=p010le:passthrough=0", "-noautoscale")
 } else {
     @("-vf", "scale_cuda=format=nv12:passthrough=0", "-noautoscale")
+}
+
+if (-not ('CxNProcessControl' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CxNProcessControl {
+    [DllImport("ntdll.dll")]
+    private static extern int NtSuspendProcess(IntPtr processHandle);
+    [DllImport("ntdll.dll")]
+    private static extern int NtResumeProcess(IntPtr processHandle);
+    public static int Suspend(IntPtr processHandle) { return NtSuspendProcess(processHandle); }
+    public static int Resume(IntPtr processHandle) { return NtResumeProcess(processHandle); }
+}
+'@
 }
 
 # --- ENVIRONMENT RELOAD ---
@@ -194,7 +213,39 @@ foreach ($p in @(
 # ==========================================================
 function Test-SeriesEpisodeFile {
     param([Parameter(Mandatory=$true)][string]$Name)
-    return ($Name -match '(?i)\bS\d{1,4}E\d{1,2}\b')
+    return ($Name -match '(?i)\bS\d{1,4}E\d{1,3}\b')
+}
+function Test-StopRequested {
+    return (-not [string]::IsNullOrWhiteSpace($StopSignalPath)) -and (Test-Path -LiteralPath $StopSignalPath)
+}
+function Get-StopRequest {
+    if (-not (Test-StopRequested)) { return "" }
+    try {
+        $request = (Get-Content -LiteralPath $StopSignalPath -Raw -ErrorAction Stop).Trim().ToLowerInvariant()
+        if ($request -eq "after") { return "after" }
+    } catch {}
+    return "now"
+}
+function Test-PauseRequested {
+    return (-not [string]::IsNullOrWhiteSpace($PauseSignalPath)) -and (Test-Path -LiteralPath $PauseSignalPath)
+}
+function Wait-WhilePaused {
+    while (Test-PauseRequested) {
+        if (Test-StopRequested) { return $false }
+        Write-StatusLine "Paused - waiting for resume"
+        Start-Sleep -Milliseconds 500
+    }
+    return $true
+}
+function Wait-ForNextCheck {
+    param([Parameter(Mandatory=$true)][int]$Seconds)
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($stopwatch.Elapsed.TotalSeconds -lt $Seconds) {
+        if (Test-StopRequested) { return $false }
+        Start-Sleep -Milliseconds 500
+    }
+    return $true
 }
 function Test-LowQualityMovieFile {
     param([Parameter(Mandatory=$true)][string]$Name)
@@ -202,17 +253,25 @@ function Test-LowQualityMovieFile {
 }
 function Get-SeasonTag {
     param([Parameter(Mandatory=$true)][string]$Name)
-    if ($Name -match '(?i)\bS(\d{1,4})E\d{1,2}\b') {
+    if ($Name -match '(?i)\bS(\d{1,4})E\d{1,3}\b') {
         return ("S{0:D2}" -f [int]$Matches[1])
     }
     return "S00"
 }
 function Get-ShowNameFromFilename {
     param([Parameter(Mandatory=$true)][string]$Name)
-    if ($Name -match '(?i)^(.*?)(?:[.\s]+)S\d{1,4}E\d{1,2}\b') {
+    if ($Name -match '(?i)^(.*?)(?:[.\s]+)S\d{1,4}E\d{1,3}\b') {
         return ((($Matches[1] -replace '\.',' ') -replace '\s+',' ').Trim())
     }
     return ((($Name -split '\.')[0]).Trim())
+}
+function Format-SeriesEpisodeTag {
+    param([Parameter(Mandatory=$true)][string]$Name)
+    $match = [regex]::Match($Name, '(?i)\bS(\d{1,4})E(\d{1,3})\b')
+    if (-not $match.Success) { return $Name }
+
+    $normalizedTag = "S{0:D2}E{1:D3}" -f [int]$match.Groups[1].Value, [int]$match.Groups[2].Value
+    return $Name.Substring(0, $match.Index) + $normalizedTag + $Name.Substring($match.Index + $match.Length)
 }
 function Get-TaggedBaseName {
     param([Parameter(Mandatory=$true)][string]$Base)
@@ -444,6 +503,7 @@ function Invoke-FFmpegProgressLogged {
     $stderrStream = [System.IO.StreamWriter]::new($stderrFile, $false, [System.Text.Encoding]::UTF8)
     $encodeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $lastProgressReportSeconds = -5.0
+    $paused = $false
 
     try {
         [void]$process.Start()
@@ -451,6 +511,45 @@ function Invoke-FFmpegProgressLogged {
         $stderrTask = $process.StandardError.ReadToEndAsync()
 
         while (-not $process.HasExited) {
+            if (Test-PauseRequested) {
+                if (-not $paused) {
+                    try {
+                        $suspendStatus = [CxNProcessControl]::Suspend($process.Handle)
+                        if ($suspendStatus -ne 0) { throw "NtSuspendProcess returned $suspendStatus" }
+                        $paused = $true
+                        Write-StatusLineBreak
+                        Write-Host "Encoding paused." -ForegroundColor Yellow
+                    } catch {
+                        Write-Host "Unable to pause FFmpeg: $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
+                }
+
+                if ($paused) {
+                    if ((Get-StopRequest) -eq "now") {
+                        try { [void][CxNProcessControl]::Resume($process.Handle) } catch {}
+                        $paused = $false
+                        Write-StatusLineBreak
+                        Write-Host "Stop requested; ending the active FFmpeg process safely..." -ForegroundColor Yellow
+                        try { $process.Kill() } catch {}
+                        break
+                    }
+                    Start-Sleep -Milliseconds 500
+                    continue
+                }
+            } elseif ($paused) {
+                try { [void][CxNProcessControl]::Resume($process.Handle) } catch {}
+                $paused = $false
+                Write-StatusLineBreak
+                Write-Host "Encoding resumed." -ForegroundColor Cyan
+            }
+
+            if ((Get-StopRequest) -eq "now") {
+                Write-StatusLineBreak
+                Write-Host "Stop requested; ending the active FFmpeg process safely..." -ForegroundColor Yellow
+                try { $process.Kill() } catch {}
+                break
+            }
+
             $progress = Get-FFmpegProgress -Path $progressFile
             if ($progress -and $progress.ContainsKey("out_time_ms")) {
                 $outTimeMs = 0.0
@@ -485,7 +584,11 @@ function Invoke-FFmpegProgressLogged {
 
         Write-StatusLineBreak
         $activityText = if ([string]::IsNullOrWhiteSpace($MediaName)) { $Activity } else { "$Activity [$MediaName]" }
-        Write-Host ("{0}: 100.0% complete in {1}" -f $activityText, $encodeStopwatch.Elapsed.ToString("hh\:mm\:ss")) -ForegroundColor Green
+        if ($process.ExitCode -eq 0) {
+            Write-Host ("{0}: 100.0% complete in {1}" -f $activityText, $encodeStopwatch.Elapsed.ToString("hh\:mm\:ss")) -ForegroundColor Green
+        } else {
+            Write-Host ("{0}: ended before completion (exit {1})" -f $activityText, $process.ExitCode) -ForegroundColor Yellow
+        }
 
         foreach ($file in @($stdoutFile, $stderrFile)) {
             if ((Test-Path -LiteralPath $file) -and ((Get-Item -LiteralPath $file).Length -gt 0)) {
@@ -495,6 +598,9 @@ function Invoke-FFmpegProgressLogged {
 
         return $process.ExitCode
     } finally {
+        if ($paused) {
+            try { [void][CxNProcessControl]::Resume($process.Handle) } catch {}
+        }
         $encodeStopwatch.Stop()
         $stdoutStream.Dispose()
         $stderrStream.Dispose()
@@ -640,20 +746,76 @@ function Test-FileLocked {
     }
 }
 
-function Get-ArchiveVideoCandidate {
+function Get-ArchiveVideoCandidates {
     param([Parameter(Mandatory=$true)][string]$ExtractionDirectory)
 
     $videoExtensions = @('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.ogv', '.mpg', '.mpeg', '.ts', '.mts')
+    $ancillaryPattern = '(?i)(sample|preview|trailer|teaser|bonus|extras|alt|variant)'
     $skipPattern = '(?i)(sample|preview|trailer|teaser|bonus|extras|part\s*\d+|disc\s*\d+|alt|variant)'
 
-    $candidates = Get-ChildItem -LiteralPath $ExtractionDirectory -File -Recurse -ErrorAction SilentlyContinue |
+    $candidates = @(Get-ChildItem -LiteralPath $ExtractionDirectory -File -Recurse -ErrorAction SilentlyContinue |
         Where-Object {
             $ext = $_.Extension.ToLowerInvariant()
-            ($videoExtensions -contains $ext) -and ($_.Name -notmatch $skipPattern)
-        }
+            $videoExtensions -contains $ext
+        } |
+        Sort-Object FullName)
 
-    if (-not $candidates) { return $null }
-    return ($candidates | Sort-Object Length -Descending | Select-Object -First 1)
+    if ($candidates.Count -eq 0) { return @() }
+
+    $episodeCandidates = @($candidates | Where-Object {
+        (Test-SeriesEpisodeFile -Name $_.Name) -and ($_.Name -notmatch $ancillaryPattern)
+    })
+    if ($episodeCandidates.Count -gt 0) {
+        return $episodeCandidates
+    }
+
+    # A movie archive may contain samples or extras. Preserve the previous
+    # behavior of selecting its largest primary video.
+    return @($candidates |
+        Where-Object { $_.Name -notmatch $skipPattern } |
+        Sort-Object Length -Descending |
+        Select-Object -First 1)
+}
+
+function Move-MisclassifiedSeriesEpisodes {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$MovieRoots,
+        [Parameter(Mandatory=$true)][string]$TvRoot
+    )
+
+    foreach ($movieRoot in @($MovieRoots | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $movieRoot)) { continue }
+
+        $episodeFiles = @(Get-ChildItem -LiteralPath $movieRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($MovieExtensions -contains $_.Extension.ToLowerInvariant()) -and
+                (Test-SeriesEpisodeFile -Name $_.Name)
+            })
+
+        foreach ($episodeFile in $episodeFiles) {
+            if (Test-StopRequested) { return }
+
+            $show = Get-ShowNameFromFilename -Name $episodeFile.Name
+            $season = Get-SeasonTag -Name $episodeFile.Name
+            $destinationDir = Join-Path (Join-Path $TvRoot $show) $season
+            $destinationBase = Format-SeriesEpisodeTag -Name $episodeFile.BaseName
+            $destination = Join-Path $destinationDir ($destinationBase + $episodeFile.Extension)
+
+            if (Test-Path -LiteralPath $destination) {
+                Write-Host "  TV destination already exists; leaving movie copy in place: $destination" -ForegroundColor Yellow
+                continue
+            }
+
+            try {
+                New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+                Move-Item -LiteralPath $episodeFile.FullName -Destination $destination -ErrorAction Stop
+                Remove-EmptyParentFolders -Path $episodeFile.DirectoryName -Stop $movieRoot
+                Write-Host "  Moved misplaced TV episode -> $destination" -ForegroundColor Green
+            } catch {
+                Write-Host "  Unable to move misplaced TV episode '$($episodeFile.FullName)': $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+    }
 }
 
 # ==========================================================
@@ -661,24 +823,39 @@ function Get-ArchiveVideoCandidate {
 # ==========================================================
 Write-Host "`n--- $EncoderTitle Service Started (RTX 5080 - Multipass Quality Mode) ---`n" -ForegroundColor Cyan
 
+Move-MisclassifiedSeriesEpisodes -MovieRoots @($PlexMoviesDir, $LowQualityMoviesDir) -TvRoot $PlexTVDir
+
 $script:ZipStabilityState = @{}
 while ($true) {
-    $zipFiles = Get-ChildItem -LiteralPath $SourceDirectory -File -Filter *.zip -ErrorAction SilentlyContinue | Sort-Object LastWriteTime
+    if (Test-StopRequested) {
+        Write-StatusLineBreak
+        Write-Host "Stop requested. Encoder service stopped." -ForegroundColor Yellow
+        break
+    }
+    if (-not (Wait-WhilePaused)) {
+        Write-StatusLineBreak
+        Write-Host "Stop requested while paused. Encoder service stopped." -ForegroundColor Yellow
+        break
+    }
+
+    $waitingZipCount = 0
+    $zipFiles = Get-ChildItem -LiteralPath $SourceDirectory -Recurse -File -Filter *.zip -ErrorAction SilentlyContinue | Sort-Object LastWriteTime
     foreach ($ZipFile in $zipFiles) {
         if (-not $script:ZipStabilityState.ContainsKey($ZipFile.FullName)) {
-            $script:ZipStabilityState[$ZipFile.FullName] = [pscustomobject]@{ LastSize = $ZipFile.Length; StableCount = 0 }
+            $script:ZipStabilityState[$ZipFile.FullName] = [pscustomobject]@{ LastSize = $ZipFile.Length }
+            $waitingZipCount++
             continue
         }
 
         $zipState = $script:ZipStabilityState[$ZipFile.FullName]
         if ($ZipFile.Length -ne $zipState.LastSize) {
             $zipState.LastSize = $ZipFile.Length
-            $zipState.StableCount = 0
+            $waitingZipCount++
             continue
         }
 
-        $zipState.StableCount++
-        if ($zipState.StableCount -lt 2 -or (Test-FileLocked -Path $ZipFile.FullName)) {
+        if (Test-FileLocked -Path $ZipFile.FullName) {
+            $waitingZipCount++
             continue
         }
 
@@ -686,100 +863,41 @@ while ($true) {
         Write-Host ("-" * 120) -ForegroundColor DarkGray
         Write-Host "Stable archive detected: $($ZipFile.Name)" -ForegroundColor Cyan
         $extractionDir = Join-Path $WorkDirectory ("zip_" + [System.IO.Path]::GetFileNameWithoutExtension($ZipFile.Name) + "_" + [guid]::NewGuid().ToString('N'))
+        $archiveQueueDir = $null
         New-Item -ItemType Directory -Path $extractionDir -Force | Out-Null
 
         try {
             Expand-Archive -LiteralPath $ZipFile.FullName -DestinationPath $extractionDir -Force
-            $archiveVideo = Get-ArchiveVideoCandidate -ExtractionDirectory $extractionDir
-            if (-not $archiveVideo) {
+            $archiveVideos = @(Get-ArchiveVideoCandidates -ExtractionDirectory $extractionDir)
+            if ($archiveVideos.Count -eq 0) {
                 Write-Host "  No usable video files found in archive. Skipping zip." -ForegroundColor Yellow
                 Remove-Item -LiteralPath $extractionDir -Recurse -Force -ErrorAction SilentlyContinue
                 $script:ZipStabilityState.Remove($ZipFile.FullName)
                 continue
             }
 
-            $archiveCandidates = Get-ChildItem -LiteralPath $extractionDir -File -Recurse -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $ext = $_.Extension.ToLowerInvariant()
-                    ($MovieExtensions -contains $ext) -and ($_.FullName -ne $archiveVideo.FullName) -and ($_.Name -notmatch '(?i)(sample|preview|trailer|teaser|bonus|extras|part\s*\d+|disc\s*\d+|alt|variant)')
-                }
-            foreach ($extraVideo in $archiveCandidates) {
-                Remove-Item -LiteralPath $extraVideo.FullName -Force -ErrorAction SilentlyContinue
+            $archiveQueueDir = Join-Path $SourceDirectory ("_archive_" + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $archiveQueueDir -Force | Out-Null
+
+            $queuedCount = 0
+            foreach ($archiveVideo in $archiveVideos) {
+                $itemQueueDir = Join-Path $archiveQueueDir ("{0:D4}" -f ($queuedCount + 1))
+                New-Item -ItemType Directory -Path $itemQueueDir -Force | Out-Null
+                Copy-Item -LiteralPath $archiveVideo.FullName -Destination (Join-Path $itemQueueDir $archiveVideo.Name) -Force -ErrorAction Stop
+                $queuedCount++
+                $classification = if (Test-SeriesEpisodeFile -Name $archiveVideo.Name) { "series episode" } else { "movie" }
+                Write-Host ("  Queued {0}: {1}" -f $classification, $archiveVideo.Name) -ForegroundColor Cyan
             }
 
-            $archiveBaseName = [System.IO.Path]::GetFileNameWithoutExtension($archiveVideo.Name)
-            $TaggedBase = Get-TaggedBaseName -Base $archiveBaseName
-            $MovieDir = Join-Path $PlexMoviesDir $TaggedBase
-            $FinalOut = Join-Path $MovieDir ($TaggedBase + ".mkv")
-            if (Test-Path -LiteralPath $FinalOut) {
-                Write-Host "  Destination already exists. Skipping zip." -ForegroundColor Yellow
-                Remove-Item -LiteralPath $extractionDir -Recurse -Force -ErrorAction SilentlyContinue
-                $script:ZipStabilityState.Remove($ZipFile.FullName)
-                continue
-            }
-
-            $WorkInput = Join-Path $WorkDirectory ($TaggedBase + [System.IO.Path]::GetExtension($archiveVideo.Name))
-            Copy-Item -LiteralPath $archiveVideo.FullName -Destination $WorkInput -Force
-
-            $Info = Get-MediaInfo -Path $WorkInput
-            if (-not $Info -or $Info.DurationSeconds -lt 60) {
-                Write-Host "  Archive video is too short or unreadable. Skipping zip." -ForegroundColor Yellow
-                Remove-Item -LiteralPath $WorkInput -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $extractionDir -Recurse -Force -ErrorAction SilentlyContinue
-                $script:ZipStabilityState.Remove($ZipFile.FullName)
-                continue
-            }
-
-            New-Item -ItemType Directory -Path $MovieDir -Force | Out-Null
-            $TempOut = Join-Path $TargetDirectory ($TaggedBase + ".temp.mkv")
-            $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-            $safe = ($TaggedBase -replace '[\\/:*?"<>|]', '_')
-            $LogFile = Join-Path $LogDirectory "$safe-$stamp.log"
-
-            $ffmpegArgs = @(
-                "-y", "-hide_banner", "-nostats", "-loglevel", "info",
-                "-ignore_unknown",
-                "-hwaccel", "cuda",
-                "-hwaccel_output_format", "cuda",
-                "-i", $WorkInput,
-                "-map", "0:V",
-                "-map", "0:a?",
-                "-c:v", $VideoEncoder,
-                "-rc", "constqp",
-                "-qp", "23",
-                "-preset", "p7",
-                "-tune", "hq",
-                "-multipass", "2",
-                "-c:a", "copy"
-            )
-            $ffmpegArgs += $VideoFilterArgs
-            $ffmpegArgs += $VideoProfileArgs
-            Add-SubtitleStreamArgs -Args ([ref]$ffmpegArgs) -Info $Info
-            $ffmpegArgs += @(
-                "-map", "0:t?",
-                "-c:t", "copy",
-                $TempOut
-            )
-
-            Write-Host ("Encoding: {0}" -f $archiveVideo.Name) -ForegroundColor Cyan
-            $exit = Invoke-FFmpegLogged -Args $ffmpegArgs -LogFile $LogFile -DurationSeconds $Info.DurationSeconds -Activity "Encoding archive movie" -MediaName $archiveVideo.Name
-            if ($exit -ne 0 -or -not (Test-Path -LiteralPath $TempOut)) {
-                Write-Host "  Archive encoding failed! exit=$exit" -ForegroundColor Red
-                Remove-Item -LiteralPath $WorkInput -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $TempOut -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $extractionDir -Recurse -Force -ErrorAction SilentlyContinue
-                continue
-            }
-
-            Move-Item -LiteralPath $TempOut -Destination $FinalOut -Force
-            Remove-Item -LiteralPath $WorkInput -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $ZipFile.FullName -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $ZipFile.FullName -Force -ErrorAction Stop
             Remove-Item -LiteralPath $extractionDir -Recurse -Force -ErrorAction SilentlyContinue
             $script:ZipStabilityState.Remove($ZipFile.FullName)
-            Write-StatusLineBreak
-            Write-Host "  Done -> $FinalOut" -ForegroundColor Green
+            Write-Host ("  Archive queued for normal classification: {0} file(s)" -f $queuedCount) -ForegroundColor Green
         } catch {
             Write-Host "  Archive processing failed: $($_.Exception.Message)" -ForegroundColor Red
+            if ($archiveQueueDir -and (Test-Path -LiteralPath $archiveQueueDir)) {
+                Remove-Item -LiteralPath $archiveQueueDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
             Remove-Item -LiteralPath $extractionDir -Recurse -Force -ErrorAction SilentlyContinue
             $script:ZipStabilityState.Remove($ZipFile.FullName)
         }
@@ -788,8 +906,12 @@ while ($true) {
     $files = Get-ChildItem -LiteralPath $SourceDirectory -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $MovieExtensions -contains $_.Extension }
     if (-not $files) {
-        Write-StatusLine "No files found. Sleeping $CheckInterval seconds..."
-        Start-Sleep -Seconds $CheckInterval
+        if ($waitingZipCount -gt 0) {
+            Write-StatusLine ("Waiting for {0} archive(s) to remain stable. Checking again in {1} seconds..." -f $waitingZipCount, $CheckInterval)
+        } else {
+            Write-StatusLine "No media or archives found. Sleeping $CheckInterval seconds..."
+        }
+        if (-not (Wait-ForNextCheck -Seconds $CheckInterval)) { continue }
         continue
     }
 
@@ -833,7 +955,7 @@ while ($true) {
             $Season = Get-SeasonTag -Name $File.Name
             $FinalSeasonDir = Join-Path (Join-Path $PlexTVDir $Show) $Season
 
-            $TaggedBase = Get-TaggedBaseName -Base $File.BaseName
+            $TaggedBase = Format-SeriesEpisodeTag -Name (Get-TaggedBaseName -Base $File.BaseName)
             $FinalOut   = Join-Path $FinalSeasonDir ($TaggedBase + ".mkv")
 
             # *** CHANGED: Always proceed for series; do not skip if folder has files ***
@@ -841,6 +963,7 @@ while ($true) {
             New-Item -ItemType Directory -Path $FinalSeasonDir -Force | Out-Null
 
             $TempOut = Join-Path $TargetDirectory ($TaggedBase + ".temp.mkv")
+            $RemuxOut = $null
             $stamp   = Get-Date -Format "yyyyMMdd-HHmmss"
             $safe    = ($TaggedBase -replace '[\\\/:\*?"<>|]', '_')
             $LogFile = Join-Path $LogDirectory "$safe-$stamp.log"
@@ -904,6 +1027,12 @@ while ($true) {
                 }
             }
 
+            if ((Get-StopRequest) -eq "now") {
+                Remove-Item -LiteralPath $TempOut,$RemuxOut -Force -ErrorAction SilentlyContinue
+                Move-Item -LiteralPath $WorkInput -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+                continue
+            }
+
             # Success: create folder if needed and move
             New-Item -ItemType Directory -Path $FinalSeasonDir -Force | Out-Null
             Move-Item -LiteralPath $CompletedTempOut -Destination $FinalOut -Force
@@ -964,6 +1093,7 @@ while ($true) {
         # Encode (movies)
         $QP = Get-QPForMinutes -Min $Info.Minutes
         $TempOut = Join-Path $TargetDirectory ($TaggedBase + ".temp.mkv")
+        $RemuxOut = $null
         $stamp   = Get-Date -Format "yyyyMMdd-HHmmss"
         $safe    = ($TaggedBase -replace '[\\\/:\*?"<>|]', '_')
         $LogFile = Join-Path $LogDirectory "$safe-$stamp.log"
@@ -1024,6 +1154,12 @@ while ($true) {
                 Write-Host "  mkvmerge remux failed; continuing without unsupported subtitles" -ForegroundColor Yellow
                 Remove-Item -LiteralPath $RemuxOut -Force -ErrorAction SilentlyContinue
             }
+        }
+
+        if ((Get-StopRequest) -eq "now") {
+            Remove-Item -LiteralPath $TempOut,$RemuxOut -Force -ErrorAction SilentlyContinue
+            Move-Item -LiteralPath $WorkInput -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+            continue
         }
 
         # Success: create folder if needed and move
