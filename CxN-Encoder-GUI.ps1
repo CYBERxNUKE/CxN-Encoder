@@ -7,6 +7,43 @@ param(
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+if (-not ('CxNTaskbarFlash' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CxNTaskbarFlash {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FLASHWINFO {
+        public uint cbSize;
+        public IntPtr hwnd;
+        public uint dwFlags;
+        public uint uCount;
+        public uint dwTimeout;
+    }
+    [DllImport("user32.dll")]
+    private static extern bool FlashWindowEx(ref FLASHWINFO info);
+    public static void Flash(IntPtr hwnd, uint count) {
+        var info = new FLASHWINFO();
+        info.cbSize = (uint)Marshal.SizeOf(info);
+        info.hwnd = hwnd;
+        info.dwFlags = 3;
+        info.uCount = count;
+        info.dwTimeout = 0;
+        FlashWindowEx(ref info);
+    }
+    public static void Stop(IntPtr hwnd) {
+        var info = new FLASHWINFO();
+        info.cbSize = (uint)Marshal.SizeOf(info);
+        info.hwnd = hwnd;
+        info.dwFlags = 0;
+        info.uCount = 0;
+        info.dwTimeout = 0;
+        FlashWindowEx(ref info);
+    }
+}
+'@
+}
+
 if ($HideConsole) {
     Add-Type -TypeDefinition @'
 using System;
@@ -42,9 +79,11 @@ $script:AllowExit = $false
 $script:ExitWhenStopped = $false
 $script:CurrentEncoderLog = $null
 $script:MaxLogCharacters = 200000
+$script:LastPendingFlashAt = [datetime]::MinValue
 
 $enginePath = Join-Path $PSScriptRoot "CxN-Encoder.ps1"
 $guiLogDirectory = Join-Path $PSScriptRoot "_gui-logs"
+$pendingDirectory = "C:\Movies\convert\_pending"
 New-Item -ItemType Directory -Path $guiLogDirectory -Force | Out-Null
 
 $form = New-Object System.Windows.Forms.Form
@@ -156,6 +195,47 @@ $progressValue.Location = New-Object System.Drawing.Point(16, 33)
 $progressValue.AutoSize = $true
 $progressPanel.Controls.Add($progressValue)
 
+$pendingPanel = New-Object System.Windows.Forms.Panel
+$pendingPanel.Dock = "Bottom"
+$pendingPanel.Height = 155
+$form.Controls.Add($pendingPanel)
+
+$pendingTitle = New-Object System.Windows.Forms.Label
+$pendingTitle.Text = "Pending - uncertain classification"
+$pendingTitle.Dock = "Top"
+$pendingTitle.Height = 25
+$pendingTitle.Padding = New-Object System.Windows.Forms.Padding(14, 8, 0, 0)
+$pendingTitle.AutoSize = $true
+$pendingPanel.Controls.Add($pendingTitle)
+
+$pendingButtons = New-Object System.Windows.Forms.FlowLayoutPanel
+$pendingButtons.Dock = "Right"
+$pendingButtons.Width = 175
+$pendingButtons.FlowDirection = "TopDown"
+$pendingButtons.WrapContents = $false
+$pendingButtons.Padding = New-Object System.Windows.Forms.Padding(4, 4, 4, 4)
+$pendingPanel.Controls.Add($pendingButtons)
+
+$pendingList = New-Object System.Windows.Forms.ListBox
+$pendingList.Dock = "Fill"
+$pendingList.Margin = New-Object System.Windows.Forms.Padding(14, 30, 8, 8)
+$pendingPanel.Controls.Add($pendingList)
+
+$refreshPendingButton = New-Object System.Windows.Forms.Button
+$refreshPendingButton.Text = "Refresh Pending"
+$refreshPendingButton.Width = 155
+$pendingButtons.Controls.Add($refreshPendingButton)
+
+$choosePendingButton = New-Object System.Windows.Forms.Button
+$choosePendingButton.Text = "Choose Destination"
+$choosePendingButton.Width = 155
+$pendingButtons.Controls.Add($choosePendingButton)
+
+$openPendingButton = New-Object System.Windows.Forms.Button
+$openPendingButton.Text = "Open Pending Folder"
+$openPendingButton.Width = 155
+$pendingButtons.Controls.Add($openPendingButton)
+
 $logBox = New-Object System.Windows.Forms.RichTextBox
 $logBox.Dock = "Fill"
 $logBox.ReadOnly = $true
@@ -165,9 +245,10 @@ $logBox.ForeColor = [System.Drawing.Color]::Gainsboro
 $logBox.Font = New-Object System.Drawing.Font("Consolas", 9)
 $form.Controls.Add($logBox)
 $form.Controls.SetChildIndex($logBox, 0)
-$form.Controls.SetChildIndex($progressPanel, 1)
-$form.Controls.SetChildIndex($statusPanel, 2)
-$form.Controls.SetChildIndex($topPanel, 3)
+$form.Controls.SetChildIndex($pendingPanel, 1)
+$form.Controls.SetChildIndex($progressPanel, 2)
+$form.Controls.SetChildIndex($statusPanel, 3)
+$form.Controls.SetChildIndex($topPanel, 4)
 
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $notifyIcon.Icon = [System.Drawing.SystemIcons]::Application
@@ -183,7 +264,7 @@ $exitMenuItem = $trayMenu.Items.Add("Exit")
 $stopMenuItem.Enabled = $false
 $notifyIcon.ContextMenuStrip = $trayMenu
 
-function Append-GuiLog {
+function Add-GuiLog {
     param([string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return }
 
@@ -218,46 +299,48 @@ function Append-GuiLog {
     $logBox.SelectionStart = $logBox.TextLength
     $logBox.ScrollToCaret()
 
-    $matches = [regex]::Matches($normalized, '(?im)^.*Processing:\s*(.+?)\s*$')
-    if ($matches.Count -gt 0) {
-        $currentValue.Text = $matches[$matches.Count - 1].Groups[1].Value
+    $regexMatches = [regex]::Matches($normalized, '(?im)^.*Processing:\s*(.+?)\s*$')
+    if ($regexMatches.Count -gt 0) {
+        $currentValue.Text = $regexMatches[$regexMatches.Count - 1].Groups[1].Value
         $script:EnginePhase = "Encoding"
         $script:IdleNoticeShown = $false
     }
 
-    $matches = [regex]::Matches($normalized, '(?im)^.*Runtime:\s*(.+?)\s*$')
-    if ($matches.Count -gt 0) { $detailsValue.Text = $matches[$matches.Count - 1].Groups[1].Value }
+    $regexMatches = [regex]::Matches($normalized, '(?im)^.*Runtime:\s*(.+?)\s*$')
+    if ($regexMatches.Count -gt 0) { $detailsValue.Text = $regexMatches[$regexMatches.Count - 1].Groups[1].Value }
 
-    $matches = [regex]::Matches($normalized, '(?im)^.*Log:\s*(.+?)\s*$')
-    if ($matches.Count -gt 0) { $script:CurrentEncoderLog = $matches[$matches.Count - 1].Groups[1].Value }
+    $regexMatches = [regex]::Matches($normalized, '(?im)^.*Log:\s*(.+?)\s*$')
+    if ($regexMatches.Count -gt 0) { $script:CurrentEncoderLog = $regexMatches[$regexMatches.Count - 1].Groups[1].Value }
 
-    $matches = [regex]::Matches($normalized, '(?im)^.*Done\s*->\s*(.+?)\s*$')
-    if ($matches.Count -gt 0) {
-        $destinationValue.Text = $matches[$matches.Count - 1].Groups[1].Value
+    $regexMatches = [regex]::Matches($normalized, '(?im)^.*Done\s*->\s*(.+?)\s*$')
+    if ($regexMatches.Count -gt 0) {
+        $destinationValue.Text = $regexMatches[$regexMatches.Count - 1].Groups[1].Value
         $progressBar.Value = 100
         $progressValue.Text = "Completed current file"
         $script:EnginePhase = "Completed"
     }
 
     if ($normalized -match '(?im)No media or archives found\. Sleeping') {
-        $progressValue.Text = "Completed current file; waiting for new media"
+        $currentValue.Text = "-"
+        $progressBar.Value = 0
+        $progressValue.Text = "Waiting for new media"
         $script:EnginePhase = "Waiting"
     }
 
-    $matches = [regex]::Matches($normalized, '(?im)(Encoding (?:series|movie)):\s*([0-9]+(?:\.[0-9]+)?)%\s*(.*?)\s*$')
-    if ($matches.Count -gt 0) {
-        $match = $matches[$matches.Count - 1]
+    $regexMatches = [regex]::Matches($normalized, '(?im)(Encoding (?:series|movie)):\s*([0-9]+(?:\.[0-9]+)?)%\s*(.*?)\s*$')
+    if ($regexMatches.Count -gt 0) {
+        $match = $regexMatches[$regexMatches.Count - 1]
         $percent = [Math]::Min(100, [Math]::Max(0, [double]$match.Groups[2].Value))
         $progressBar.Value = [int][Math]::Round($percent)
         $progressValue.Text = "{0}: {1:N1}%  {2}" -f $match.Groups[1].Value, $percent, $match.Groups[3].Value
     }
 }
 
-function Close-LogReaders {
+function Close-LogReader {
     foreach ($readerName in @("OutputReader", "ErrorReader")) {
         $reader = Get-Variable -Name $readerName -Scope Script -ValueOnly
         if ($reader) {
-            try { $reader.Dispose() } catch {}
+            try { $reader.Dispose() } catch { $null = $_ }
             Set-Variable -Name $readerName -Scope Script -Value $null
         }
     }
@@ -270,7 +353,7 @@ function Open-LogReader {
     return [System.IO.StreamReader]::new($stream)
 }
 
-function Update-RunningControls {
+function Set-RunningControl {
     param([bool]$Running)
     $startButton.Enabled = -not $Running
     $startMenuItem.Enabled = -not $Running
@@ -281,20 +364,88 @@ function Update-RunningControls {
     $stopMenuItem.Enabled = $Running
 }
 
+function Sync-PendingList {
+    $pendingFiles = @(Get-ChildItem -LiteralPath $pendingDirectory -File -ErrorAction SilentlyContinue | Sort-Object Name)
+    $paths = @($pendingFiles | ForEach-Object { $_.FullName })
+    $currentPaths = @($pendingList.Items | ForEach-Object { [string]$_ })
+    if (($paths -join "`n") -ne ($currentPaths -join "`n")) {
+        $selectedPath = [string]$pendingList.SelectedItem
+        $pendingList.BeginUpdate()
+        try {
+            $pendingList.Items.Clear()
+            foreach ($path in $paths) { [void]$pendingList.Items.Add($path) }
+            if ($selectedPath -and ($paths -contains $selectedPath)) {
+                $pendingList.SelectedItem = $selectedPath
+            }
+        } finally {
+            $pendingList.EndUpdate()
+        }
+    }
+    $pendingTitle.Text = "Pending - uncertain classification ($($paths.Count))"
+    return $paths.Count
+}
+
+function Update-PendingTaskbarAttention {
+    param([int]$PendingCount)
+
+    if ($PendingCount -le 0) {
+        try { [CxNTaskbarFlash]::Stop($form.Handle) } catch { $null = $_ }
+        return
+    }
+
+    if (((Get-Date) - $script:LastPendingFlashAt).TotalSeconds -ge 5) {
+        try { [CxNTaskbarFlash]::Flash($form.Handle, 3) } catch { $null = $_ }
+        $script:LastPendingFlashAt = Get-Date
+    }
+}
+
+function Move-SelectedPendingFile {
+    $source = [string]$pendingList.SelectedItem
+    if ([string]::IsNullOrWhiteSpace($source) -or -not (Test-Path -LiteralPath $source)) { return }
+
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = "Choose where to move the pending file"
+    $dialog.ShowNewFolderButton = $true
+    try {
+        if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $destination = Join-Path $dialog.SelectedPath ([System.IO.Path]::GetFileName($source))
+        if (Test-Path -LiteralPath $destination) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "A file with that name already exists in the selected folder.",
+                "Pending file not moved",
+                "OK",
+                "Warning"
+            ) | Out-Null
+            return
+        }
+        Move-Item -LiteralPath $source -Destination $destination -ErrorAction Stop
+        Add-GuiLog "Pending file moved to: $destination`r`n"
+        [CxNTaskbarFlash]::Stop($form.Handle)
+        Sync-PendingList | Out-Null
+    } catch {
+        Add-GuiLog "Unable to move pending file: $($_.Exception.Message)`r`n"
+    } finally {
+        $dialog.Dispose()
+    }
+}
+
 function Start-Encoder {
     if ($script:EncoderProcess -and -not $script:EncoderProcess.HasExited) { return }
 
+    $enginePattern = '(?i)-File\s+"?' + [regex]::Escape($enginePath) + '"?'
     $otherEncoder = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object {
             $_.ProcessId -ne $PID -and
             $_.Name -in @("powershell.exe", "pwsh.exe") -and
-            $_.CommandLine -match '(?i)(?:CxN-Encoder\.ps1|x26[45]-folder-encoder\.ps1)'
+            $_.CommandLine -and
+            $_.CommandLine -match $enginePattern -and
+            $_.CommandLine -match '(?i)-Codec\s+(?:x264|x265)\b'
         } |
         Select-Object -First 1
     if ($otherEncoder) {
         $stateValue.Text = "Another encoder is already running"
         $processValue.Text = "External PID $($otherEncoder.ProcessId)"
-        Append-GuiLog "Start blocked: another encoder process is already running (PID $($otherEncoder.ProcessId)).`r`n"
+        Add-GuiLog "Start blocked: another encoder process is already running (PID $($otherEncoder.ProcessId)).`r`n"
         [System.Windows.Forms.MessageBox]::Show(
             "Another CxN-Encoder process is already running (PID $($otherEncoder.ProcessId)). Stop it before starting a GUI-controlled encoder.",
             "CxN-Encoder",
@@ -304,7 +455,7 @@ function Start-Encoder {
         return
     }
 
-    Close-LogReaders
+    Close-LogReader
     $codec = if ($codecBox.SelectedIndex -eq 1) { "x264" } else { "x265" }
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $outputPath = Join-Path $guiLogDirectory "gui-$codec-$stamp.out.log"
@@ -338,12 +489,12 @@ function Start-Encoder {
         $processValue.Text = "$codec, PID $($script:EncoderProcess.Id), started $($script:StartedAt.ToString('g'))"
         $progressValue.Text = "Starting encoder service..."
         $progressBar.Value = 0
-        Update-RunningControls -Running $true
-        Append-GuiLog "`r`n===== Started $codec at $($script:StartedAt) =====`r`n"
+        Set-RunningControl -Running $true
+        Add-GuiLog "`r`n===== Started $codec at $($script:StartedAt) =====`r`n"
     } catch {
         $stateValue.Text = "Start failed"
-        Append-GuiLog "Start failed: $($_.Exception.Message)`r`n"
-        Update-RunningControls -Running $false
+        Add-GuiLog "Start failed: $($_.Exception.Message)`r`n"
+        Set-RunningControl -Running $false
     }
 }
 
@@ -352,15 +503,17 @@ function Stop-Encoder {
     if ($script:StopRequestedAt) { return }
 
     try {
-        $answer = [System.Windows.Forms.MessageBox]::Show(
-            "Yes: stop now, return the active file, and clean temporary output.`r`nNo: finish the current file, then stop.`r`nCancel: keep encoding.",
-            "Stop CxN-Encoder?",
-            "YesNoCancel",
-            "Question"
-        )
-        if ($answer -eq [System.Windows.Forms.DialogResult]::Cancel) { return }
-
-        $script:StopMode = if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) { "now" } else { "after" }
+        $script:StopMode = "now"
+        if ($script:EnginePhase -eq "Encoding") {
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                "Yes: stop now, return the active file, and clean temporary output.`r`nNo: finish the current file, then stop.`r`nCancel: keep encoding.",
+                "Stop CxN-Encoder?",
+                "YesNoCancel",
+                "Question"
+            )
+            if ($answer -eq [System.Windows.Forms.DialogResult]::Cancel) { return }
+            $script:StopMode = if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) { "now" } else { "after" }
+        }
         if ($script:StopMode -eq "after" -and $script:IsPaused) {
             Remove-Item -LiteralPath $script:PauseSignalPath -Force -ErrorAction SilentlyContinue
             $script:IsPaused = $false
@@ -368,33 +521,33 @@ function Stop-Encoder {
         $script:StopMode | Set-Content -LiteralPath $script:StopSignalPath -Encoding Ascii
         $script:StopRequestedAt = Get-Date
         $stateValue.Text = if ($script:StopMode -eq "now") { "Stopping now safely" } else { "Finishing current file" }
-        $progressValue.Text = if ($script:StopMode -eq "now") { "Returning the active file and cleaning temporary output..." } else { "Current file will finish, then the encoder will stop..." }
+        $progressValue.Text = if ($script:EnginePhase -eq "Encoding" -and $script:StopMode -eq "now") { "Returning the active file and cleaning temporary output..." } elseif ($script:StopMode -eq "after") { "Current file will finish, then the encoder will stop..." } else { "Stopping idle encoder service..." }
         $stopButton.Enabled = $false
         $pauseButton.Enabled = $false
         $stopMenuItem.Enabled = $false
-        Append-GuiLog "`r`n===== Stop requested: $($script:StopMode) =====`r`n"
+        Add-GuiLog "`r`n===== Stop requested: $($script:StopMode) =====`r`n"
     } catch {
-        Append-GuiLog "Unable to request stop: $($_.Exception.Message)`r`n"
+        Add-GuiLog "Unable to request stop: $($_.Exception.Message)`r`n"
     }
 }
 
-function Toggle-Pause {
+function Switch-Pause {
     if (-not $script:EncoderProcess -or $script:EncoderProcess.HasExited -or $script:StopRequestedAt) { return }
     try {
         if ($script:IsPaused) {
             Remove-Item -LiteralPath $script:PauseSignalPath -Force -ErrorAction SilentlyContinue
             $script:IsPaused = $false
             $stateValue.Text = "Running"
-            Append-GuiLog "`r`n===== Resume requested =====`r`n"
+            Add-GuiLog "`r`n===== Resume requested =====`r`n"
         } else {
             "pause" | Set-Content -LiteralPath $script:PauseSignalPath -Encoding Ascii
             $script:IsPaused = $true
             $stateValue.Text = "Paused"
-            Append-GuiLog "`r`n===== Pause requested =====`r`n"
+            Add-GuiLog "`r`n===== Pause requested =====`r`n"
         }
-        Update-RunningControls -Running $true
+        Set-RunningControl -Running $true
     } catch {
-        Append-GuiLog "Unable to change pause state: $($_.Exception.Message)`r`n"
+        Add-GuiLog "Unable to change pause state: $($_.Exception.Message)`r`n"
     }
 }
 
@@ -407,14 +560,16 @@ function Show-MainWindow {
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 500
 $timer.Add_Tick({
+    $pendingCount = Sync-PendingList
+    Update-PendingTaskbarAttention -PendingCount $pendingCount
     if (-not $script:EncoderProcess) { return }
 
     if (-not $script:OutputReader) { $script:OutputReader = Open-LogReader -Path $script:OutputPath }
     if (-not $script:ErrorReader) { $script:ErrorReader = Open-LogReader -Path $script:ErrorPath }
-    if ($script:OutputReader) { Append-GuiLog -Text $script:OutputReader.ReadToEnd() }
-    if ($script:ErrorReader) { Append-GuiLog -Text $script:ErrorReader.ReadToEnd() }
+    if ($script:OutputReader) { Add-GuiLog -Text $script:OutputReader.ReadToEnd() }
+    if ($script:ErrorReader) { Add-GuiLog -Text $script:ErrorReader.ReadToEnd() }
 
-    try { $script:EncoderProcess.Refresh() } catch {}
+    try { $script:EncoderProcess.Refresh() } catch { $null = $_ }
     if (-not $script:EncoderProcess.HasExited) {
         if ($script:StartedAt) {
             $elapsed = (Get-Date) - $script:StartedAt
@@ -428,22 +583,22 @@ $timer.Add_Tick({
         }
 
         if ($script:StopRequestedAt -and (((Get-Date) - $script:StopRequestedAt).TotalSeconds -gt 30)) {
-            Append-GuiLog "Safe stop timed out; terminating the process tree.`r`n"
+            Add-GuiLog "Safe stop timed out; terminating the process tree.`r`n"
             Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" -ArgumentList @('/PID', $script:EncoderProcess.Id, '/T', '/F') -WindowStyle Hidden -Wait
         }
         return
     }
 
-    if ($script:OutputReader) { Append-GuiLog -Text $script:OutputReader.ReadToEnd() }
-    if ($script:ErrorReader) { Append-GuiLog -Text $script:ErrorReader.ReadToEnd() }
+    if ($script:OutputReader) { Add-GuiLog -Text $script:OutputReader.ReadToEnd() }
+    if ($script:ErrorReader) { Add-GuiLog -Text $script:ErrorReader.ReadToEnd() }
     $exitCode = $script:EncoderProcess.ExitCode
-    Close-LogReaders
+    Close-LogReader
     Remove-Item -LiteralPath $script:StopSignalPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $script:PauseSignalPath -Force -ErrorAction SilentlyContinue
     $stateValue.Text = if ($script:StopRequestedAt) { "Stopped" } elseif ($exitCode -eq 0) { "Stopped" } else { "Exited with code $exitCode" }
     $progressValue.Text = "Encoder process is not running"
-    Update-RunningControls -Running $false
-    Append-GuiLog "`r`n===== Encoder exited with code $exitCode =====`r`n"
+    Set-RunningControl -Running $false
+    Add-GuiLog "`r`n===== Encoder exited with code $exitCode =====`r`n"
     $script:EncoderProcess = $null
     $script:StopRequestedAt = $null
     $script:StopMode = $null
@@ -461,8 +616,18 @@ $startButton.Add_Click({ Start-Encoder })
 $startMenuItem.Add_Click({ Start-Encoder })
 $stopButton.Add_Click({ Stop-Encoder })
 $stopMenuItem.Add_Click({ Stop-Encoder })
-$pauseButton.Add_Click({ Toggle-Pause })
+$pauseButton.Add_Click({ Switch-Pause })
 $clearButton.Add_Click({ $logBox.Clear() })
+$refreshPendingButton.Add_Click({ Sync-PendingList | Out-Null })
+$choosePendingButton.Add_Click({ Move-SelectedPendingFile })
+$openPendingButton.Add_Click({
+    if (Test-Path -LiteralPath $pendingDirectory) {
+        Start-Process -FilePath "explorer.exe" -ArgumentList ('"' + $pendingDirectory + '"')
+    }
+})
+$pendingList.Add_SelectedIndexChanged({
+    try { [CxNTaskbarFlash]::Stop($form.Handle) } catch { $null = $_ }
+})
 $openLogsButton.Add_Click({
     $path = if ($script:CurrentEncoderLog -and (Test-Path -LiteralPath $script:CurrentEncoderLog)) {
         Split-Path -Parent $script:CurrentEncoderLog
@@ -495,9 +660,10 @@ $exitMenuItem.Add_Click({
 })
 
 $form.Add_FormClosing({
-    param($sender, $eventArgs)
+    param($eventSender, $formEventArgs)
+    $null = $eventSender
     if (-not $script:AllowExit) {
-        $eventArgs.Cancel = $true
+        $formEventArgs.Cancel = $true
         $form.Hide()
         $notifyIcon.ShowBalloonTip(1500, "CxN-Encoder", "Use the tray icon to restore or exit the application.", [System.Windows.Forms.ToolTipIcon]::Info)
     }
@@ -505,7 +671,7 @@ $form.Add_FormClosing({
 
 $form.Add_FormClosed({
     $timer.Stop()
-    Close-LogReaders
+    Close-LogReader
     $notifyIcon.Visible = $false
     $notifyIcon.Dispose()
 })

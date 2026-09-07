@@ -69,10 +69,11 @@ To use the original console-only service, add `-Headless`:
 
 H.264 uses `h264_nvenc`; H.265 uses `hevc_nvenc`.
 
-Both encoder modes normalize decoded frames with `scale_cuda` before NVENC and
-disable FFmpeg's automatic output scaler. This keeps format and color-property
-changes inside the GPU path instead of inserting an incompatible software
-scaler mid-encode.
+Both encoder modes use NVENC for encoding. CUDA decoding is disabled by default
+because NVDEC decoder creation was failing with CUDA out-of-memory errors on the
+current system. x265 converts to `p010le` and x264 converts to `nv12` with a
+software format filter before NVENC. Set `$UseCudaDecode` to `$true` in the
+configuration section to test the all-GPU path again.
 
 ## Important behavior
 
@@ -82,3 +83,21 @@ folders. Test with disposable files and verify every configured path before
 using it with a media library.
 
 Stop a headless monitoring loop with `Ctrl+C`.
+
+To check for a running or stale encoder when the GUI is not open:
+
+```powershell
+.\Get-CxN-Encoder-Status.ps1
+.\Get-CxN-Encoder-Status.ps1 -Codec x265
+```
+
+Each codec has a status file in `_status` containing the process ID, unique
+instance ID, current file, and heartbeat time. A status is marked stale when
+the matching encoder process is gone or its heartbeat is more than 10 minutes
+old. The instance ID also prevents an older process from deleting a newer
+status file during cleanup.
+
+Files without a confident TV episode or movie naming indicator are moved to
+`C:\Movies\convert\_pending`. Encoding continues with the remaining files.
+The GUI lists pending files, flashes its taskbar icon when they arrive, and
+provides a button to choose a destination folder for each file.

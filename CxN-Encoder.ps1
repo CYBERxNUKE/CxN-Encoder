@@ -14,6 +14,7 @@ param(
 
 $EncoderTitle = "CxN-Encoder $Codec"
 try { $Host.UI.RawUI.WindowTitle = $EncoderTitle } catch {}
+$UseCudaDecode = $false
 
 $VideoEncoder = if ($Codec -eq "x265") { "hevc_nvenc" } else { "h264_nvenc" }
 $VideoProfileArgs = if ($Codec -eq "x265") {
@@ -21,10 +22,16 @@ $VideoProfileArgs = if ($Codec -eq "x265") {
 } else {
     @("-profile:v", "high")
 }
-$VideoFilterArgs = if ($Codec -eq "x265") {
-    @("-vf", "scale_cuda=format=p010le:passthrough=0", "-noautoscale")
+$VideoFilterArgs = if ($UseCudaDecode) {
+    if ($Codec -eq "x265") {
+        @("-vf", "scale_cuda=format=p010le:passthrough=0", "-noautoscale")
+    } else {
+        @("-vf", "scale_cuda=format=nv12:passthrough=0", "-noautoscale")
+    }
+} elseif ($Codec -eq "x265") {
+    @("-vf", "format=p010le")
 } else {
-    @("-vf", "scale_cuda=format=nv12:passthrough=0", "-noautoscale")
+    @("-vf", "format=nv12")
 }
 
 if (-not ('CxNProcessControl' -as [type])) {
@@ -51,10 +58,15 @@ $SourceDirectory = "V:\encode"
 $TargetDirectory = "C:\Movies\convert"
 $WorkDirectory   = Join-Path $TargetDirectory "_work"
 $LogDirectory    = Join-Path $TargetDirectory "_logs"
+$StatusDirectory  = Join-Path $TargetDirectory "_status"
+$PendingDirectory = Join-Path $TargetDirectory "_pending"
+$StatusFile       = Join-Path $StatusDirectory ("CxN-{0}.json" -f $Codec)
 $PlexMoviesDir   = "V:\Plex\Shared Movies"
 $LowQualityMoviesDir = "U:\Plex\Shared Movies"
 $PlexTVDir       = "U:\Plex\TV Shows"
 $CheckInterval   = 120
+$FFmpegDecodeThreads = 0
+$ExtraHWFrames   = 0
 $MoveRetryDelaySeconds = 10
 $MoveRetryAttempts = 2
 $CustomTag       = "-CxN"
@@ -63,6 +75,17 @@ $MovieExtensions = ".mkv",".mp4",".avi",".mov",".wmv",".flv",".webm",".m4v",".3g
 # Movie-only smart skip thresholds
 $MaxGBPerHour = 1.6
 $MaxVideoKbps = 4200
+
+$DecodeArgs = if ($UseCudaDecode) {
+    @(
+        "-threads:v", "$FFmpegDecodeThreads",
+        "-extra_hw_frames", "$ExtraHWFrames",
+        "-hwaccel", "cuda",
+        "-hwaccel_output_format", "cuda"
+    )
+} else {
+    @("-threads:v", "$FFmpegDecodeThreads")
+}
 
 function Install-FFmpegPackage {
     Install-RequiredPackage -DisplayName "FFmpeg" -PackageId "Gyan.FFmpeg"
@@ -203,17 +226,71 @@ $script:MKVMergeResolutionAttempted = $false
 # --- ENSURE DIRS ---
 foreach ($p in @(
     $SourceDirectory,$TargetDirectory,$WorkDirectory,
-    $LogDirectory,$PlexMoviesDir,$LowQualityMoviesDir,$PlexTVDir
+    $LogDirectory,$StatusDirectory,$PendingDirectory,
+    $PlexMoviesDir,$LowQualityMoviesDir,$PlexTVDir
 )) {
     if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p | Out-Null }
 }
+
+$script:EncoderInstanceId = [guid]::NewGuid().ToString('N')
+$script:EncoderStartedAt = Get-Date
+$script:EncoderCurrentFile = ""
+$script:LastStatusWriteAt = [datetime]::MinValue
+$script:LastStatusState = ""
+$script:LastStatusFile = ""
+
+function Write-EncoderStatus {
+    param([string]$State = "running")
+
+    $now = Get-Date
+    if (($script:LastStatusState -eq $State) -and
+        ($script:LastStatusFile -eq $script:EncoderCurrentFile) -and
+        (($now - $script:LastStatusWriteAt).TotalSeconds -lt 5)) {
+        return
+    }
+
+    $status = [ordered]@{
+        instance_id = $script:EncoderInstanceId
+        pid = $PID
+        codec = $Codec
+        state = $State
+        started_at = $script:EncoderStartedAt.ToUniversalTime().ToString('o')
+        heartbeat_at = $now.ToUniversalTime().ToString('o')
+        current_file = $script:EncoderCurrentFile
+        status_file = $StatusFile
+    }
+    $temporaryStatusFile = "$StatusFile.$($script:EncoderInstanceId).tmp"
+    try {
+        $status | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $temporaryStatusFile -Encoding utf8
+        Move-Item -LiteralPath $temporaryStatusFile -Destination $StatusFile -Force
+        $script:LastStatusWriteAt = $now
+        $script:LastStatusState = $State
+        $script:LastStatusFile = $script:EncoderCurrentFile
+    } catch {
+        Remove-Item -LiteralPath $temporaryStatusFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-EncoderStatus {
+    try {
+        if (Test-Path -LiteralPath $StatusFile) {
+            $existing = Get-Content -LiteralPath $StatusFile -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ([string]$existing.instance_id -eq $script:EncoderInstanceId) {
+                Remove-Item -LiteralPath $StatusFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {}
+}
+
+Write-EncoderStatus -State "starting"
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { Remove-EncoderStatus } | Out-Null
 
 # ==========================================================
 # HELPERS
 # ==========================================================
 function Test-SeriesEpisodeFile {
     param([Parameter(Mandatory=$true)][string]$Name)
-    return ($Name -match '(?i)\bS\d{1,4}E\d{1,3}\b')
+    return ($Name -match '(?i)(?:^|[.\s_-])S\d{1,4}E\d{1,3}(?=$|[.\s_-])')
 }
 function Test-StopRequested {
     return (-not [string]::IsNullOrWhiteSpace($StopSignalPath)) -and (Test-Path -LiteralPath $StopSignalPath)
@@ -233,6 +310,7 @@ function Wait-WhilePaused {
     while (Test-PauseRequested) {
         if (Test-StopRequested) { return $false }
         Write-StatusLine "Paused - waiting for resume"
+        Write-EncoderStatus -State "paused"
         Start-Sleep -Milliseconds 500
     }
     return $true
@@ -243,6 +321,7 @@ function Wait-ForNextCheck {
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($stopwatch.Elapsed.TotalSeconds -lt $Seconds) {
         if (Test-StopRequested) { return $false }
+        Write-EncoderStatus -State "idle"
         Start-Sleep -Milliseconds 500
     }
     return $true
@@ -251,23 +330,40 @@ function Test-LowQualityMovieFile {
     param([Parameter(Mandatory=$true)][string]$Name)
     return ($Name -match '(?i)(?:^|[.\s_-])(screener|cam|hdcam|camhd|ts|telesync)(?:[.\s_-]|$)')
 }
+function Test-ConfidentMovieFile {
+    param([Parameter(Mandatory=$true)][string]$Name)
+
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($Name)
+    return ($base -match '(?i)(?<!\d)(?:19\d{2}|20\d{2})(?!\d)') -or
+        ($base -match '(?i)(?:2160p|1080p|720p|480p|4k|bluray|brrip|webrip|web[-. ]?dl|remux|hdr|dv|x264|x265|h264|h265|hevc|avc|aac|dts|proper|repack|extended|theatrical)')
+}
+function Get-PendingPath {
+    param([Parameter(Mandatory=$true)][string]$Name)
+
+    $candidate = Join-Path $PendingDirectory $Name
+    if (-not (Test-Path -LiteralPath $candidate)) { return $candidate }
+
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($Name)
+    $extension = [System.IO.Path]::GetExtension($Name)
+    return (Join-Path $PendingDirectory ("{0}-pending-{1}{2}" -f $stem, [guid]::NewGuid().ToString('N'), $extension))
+}
 function Get-SeasonTag {
     param([Parameter(Mandatory=$true)][string]$Name)
-    if ($Name -match '(?i)\bS(\d{1,4})E\d{1,3}\b') {
+    if ($Name -match '(?i)(?:^|[.\s_-])S(\d{1,4})E\d{1,3}(?=$|[.\s_-])') {
         return ("S{0:D2}" -f [int]$Matches[1])
     }
     return "S00"
 }
 function Get-ShowNameFromFilename {
     param([Parameter(Mandatory=$true)][string]$Name)
-    if ($Name -match '(?i)^(.*?)(?:[.\s]+)S\d{1,4}E\d{1,3}\b') {
-        return ((($Matches[1] -replace '\.',' ') -replace '\s+',' ').Trim())
+    if ($Name -match '(?i)^(.*?)[.\s_-]+S\d{1,4}E\d{1,3}\b') {
+        return ((($Matches[1] -replace '[._-]',' ') -replace '\s+',' ').Trim())
     }
     return ((($Name -split '\.')[0]).Trim())
 }
 function Format-SeriesEpisodeTag {
     param([Parameter(Mandatory=$true)][string]$Name)
-    $match = [regex]::Match($Name, '(?i)\bS(\d{1,4})E(\d{1,3})\b')
+    $match = [regex]::Match($Name, '(?i)S(\d{1,4})E(\d{1,3})(?=$|[.\s_-])')
     if (-not $match.Success) { return $Name }
 
     $normalizedTag = "S{0:D2}E{1:D3}" -f [int]$match.Groups[1].Value, [int]$match.Groups[2].Value
@@ -277,8 +373,7 @@ function Get-TaggedBaseName {
     param([Parameter(Mandatory=$true)][string]$Base)
     $normalized = ($Base -replace '(?i)(^|[.\s_-])(?:h|x)(?:\.?)26[45](?=$|[.\s_-])', "`${1}$Codec")
     if ($normalized -match [regex]::Escape($CustomTag) + '$') { return $normalized }
-    $clean = ($normalized -replace '(-[^\-]*)$','').Trim()
-    if ([string]::IsNullOrWhiteSpace($clean)) { $clean = $normalized }
+    $clean = $normalized.Trim()
     return ($clean + $CustomTag)
 }
 function Get-QPForMinutes {
@@ -573,6 +668,7 @@ function Invoke-FFmpegProgressLogged {
                 }
             }
 
+            Write-EncoderStatus -State "encoding"
             Start-Sleep -Milliseconds 500
         }
 
@@ -725,6 +821,7 @@ function Write-StatusLine {
     $text = if ([string]::IsNullOrWhiteSpace($Message)) { "" } else { "[{0}] {1}" -f (Get-Date -Format 'hh:mm:ss tt'), $Message }
     $padding = ' ' * [Math]::Max(0, 120 - $text.Length)
     [Console]::Write("`r" + $text + $padding)
+    Write-EncoderStatus -State $(if ([string]::IsNullOrWhiteSpace($script:EncoderCurrentFile)) { "idle" } else { "encoding" })
 }
 
 function Write-StatusLineBreak {
@@ -827,14 +924,18 @@ Move-MisclassifiedSeriesEpisodes -MovieRoots @($PlexMoviesDir, $LowQualityMovies
 
 $script:ZipStabilityState = @{}
 while ($true) {
+    $script:EncoderCurrentFile = ""
+    Write-EncoderStatus -State "idle"
     if (Test-StopRequested) {
         Write-StatusLineBreak
         Write-Host "Stop requested. Encoder service stopped." -ForegroundColor Yellow
+        Write-EncoderStatus -State "stopping"
         break
     }
     if (-not (Wait-WhilePaused)) {
         Write-StatusLineBreak
         Write-Host "Stop requested while paused. Encoder service stopped." -ForegroundColor Yellow
+        Write-EncoderStatus -State "stopping"
         break
     }
 
@@ -904,7 +1005,7 @@ while ($true) {
     }
 
     $files = Get-ChildItem -LiteralPath $SourceDirectory -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $MovieExtensions -contains $_.Extension }
+        Where-Object { $MovieExtensions -contains $_.Extension.ToLowerInvariant() }
     if (-not $files) {
         if ($waitingZipCount -gt 0) {
             Write-StatusLine ("Waiting for {0} archive(s) to remain stable. Checking again in {1} seconds..." -f $waitingZipCount, $CheckInterval)
@@ -916,11 +1017,24 @@ while ($true) {
     }
 
     foreach ($File in $files) {
+        if (Test-StopRequested) { break }
+        $script:EncoderCurrentFile = $File.FullName
+        Write-EncoderStatus -State "processing"
         Write-StatusLineBreak
         Write-Host ("-" * 120) -ForegroundColor DarkGray
         Write-Host ("[{0}] Processing: {1}" -f (Get-Date -Format 'hh:mm:ss tt'), $File.Name) -ForegroundColor Cyan
         $OriginalParent = $File.DirectoryName
         $IsSeries = Test-SeriesEpisodeFile -Name $File.Name
+
+        if (-not $IsSeries -and -not (Test-ConfidentMovieFile -Name $File.Name)) {
+            $pendingPath = Get-PendingPath -Name $File.Name
+            if (Move-ItemWithRetry -Source $File.FullName -Destination $pendingPath) {
+                Remove-EmptyParentFolders -Path $OriginalParent -Stop $SourceDirectory
+                Write-StatusLineBreak
+                Write-Host "  Uncertain classification -> pending: $pendingPath" -ForegroundColor Yellow
+            }
+            continue
+        }
 
         $WorkInput = Join-Path $WorkDirectory $File.Name
         if (-not (Move-ItemWithRetry -Source $File.FullName -Destination $WorkInput)) {
@@ -930,7 +1044,7 @@ while ($true) {
         $Info = Get-MediaInfo -Path $WorkInput
         if (-not $Info -or $Info.DurationSeconds -lt 60) {
             Write-Host "  Skipping (ffprobe failed or <60s)" -ForegroundColor Yellow
-            Move-Item -LiteralPath $WorkInput -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+            Move-ItemWithRetry -Source $WorkInput -Destination $File.FullName | Out-Null
             continue
         }
 
@@ -958,9 +1072,11 @@ while ($true) {
             $TaggedBase = Format-SeriesEpisodeTag -Name (Get-TaggedBaseName -Base $File.BaseName)
             $FinalOut   = Join-Path $FinalSeasonDir ($TaggedBase + ".mkv")
 
-            # *** CHANGED: Always proceed for series; do not skip if folder has files ***
-            # Destination handling for series: always proceed, create folder if needed
-            New-Item -ItemType Directory -Path $FinalSeasonDir -Force | Out-Null
+            if (Test-Path -LiteralPath $FinalOut) {
+                Write-Host "  TV destination file already exists -> skipping: $FinalOut" -ForegroundColor Red
+                Move-ItemWithRetry -Source $WorkInput -Destination $File.FullName | Out-Null
+                continue
+            }
 
             $TempOut = Join-Path $TargetDirectory ($TaggedBase + ".temp.mkv")
             $RemuxOut = $null
@@ -975,9 +1091,8 @@ while ($true) {
 
             $ffmpegArgs = @(
                 "-y", "-hide_banner", "-nostats", "-loglevel", "info",
-                "-ignore_unknown",
-                "-hwaccel", "cuda",
-                "-hwaccel_output_format", "cuda",
+                "-ignore_unknown"
+            ) + $DecodeArgs + @(
                 "-i", $WorkInput,
                 "-map", "0:V",
                 "-map", "0:a?",
@@ -1009,7 +1124,7 @@ while ($true) {
                     Get-Content -LiteralPath $LogFile -Tail 80 | ForEach-Object { Write-Host $_ }
                     Write-StatusLineBreak; Write-Host "--- end tail ---" -ForegroundColor DarkYellow
                 }
-                Move-Item -LiteralPath $WorkInput -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+                Move-ItemWithRetry -Source $WorkInput -Destination $File.FullName | Out-Null
                 Remove-Item -LiteralPath $TempOut -Force -ErrorAction SilentlyContinue
                 continue
             }
@@ -1029,13 +1144,13 @@ while ($true) {
 
             if ((Get-StopRequest) -eq "now") {
                 Remove-Item -LiteralPath $TempOut,$RemuxOut -Force -ErrorAction SilentlyContinue
-                Move-Item -LiteralPath $WorkInput -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+                Move-ItemWithRetry -Source $WorkInput -Destination $File.FullName | Out-Null
                 continue
             }
 
             # Success: create folder if needed and move
             New-Item -ItemType Directory -Path $FinalSeasonDir -Force | Out-Null
-            Move-Item -LiteralPath $CompletedTempOut -Destination $FinalOut -Force
+            Move-Item -LiteralPath $CompletedTempOut -Destination $FinalOut -Force -ErrorAction Stop
             Remove-Item -LiteralPath $WorkInput -Force -ErrorAction SilentlyContinue
             Remove-EmptyParentFolders -Path $OriginalParent -Stop $SourceDirectory
             Write-StatusLineBreak
@@ -1067,14 +1182,14 @@ while ($true) {
         if ($UseFlatMovieOutput) {
             if ((Test-Path -LiteralPath $FinalOut) -or (Test-Path -LiteralPath $AsIsMovieOut)) {
                 Write-Host "  Destination file already exists -> skipping: $MovieDir" -ForegroundColor Red
-                Move-Item -LiteralPath $WorkInput -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+                Move-ItemWithRetry -Source $WorkInput -Destination $File.FullName | Out-Null
                 continue
             }
         } elseif (Test-Path -LiteralPath $MovieDir) {
             $items = Get-ChildItem -LiteralPath $MovieDir -Force -ErrorAction SilentlyContinue
             if ($items.Count -gt 0) {
                 Write-Host "  Destination folder exists and is NOT empty -> skipping: $MovieDir" -ForegroundColor Red
-                Move-Item -LiteralPath $WorkInput -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+                Move-ItemWithRetry -Source $WorkInput -Destination $File.FullName | Out-Null
                 continue
             }
             # Folder exists but empty: proceed
@@ -1083,7 +1198,7 @@ while ($true) {
         if (Test-AlreadyCompressed -Path $WorkInput -Info $Info) {
             Write-Host "  MOVIE already compressed -> moving as-is" -ForegroundColor Magenta
             if (-not $UseFlatMovieOutput) { New-Item -ItemType Directory -Path $MovieDir -Force | Out-Null }
-            Move-Item -LiteralPath $WorkInput -Destination $AsIsMovieOut -Force
+            Move-Item -LiteralPath $WorkInput -Destination $AsIsMovieOut -Force -ErrorAction Stop
             Remove-EmptyParentFolders -Path $OriginalParent -Stop $SourceDirectory
             Write-StatusLineBreak
             Write-Host "  Done -> $AsIsMovieOut" -ForegroundColor Green
@@ -1104,9 +1219,8 @@ while ($true) {
         Write-StatusLineBreak
         $ffmpegArgs = @(
             "-y", "-hide_banner", "-nostats", "-loglevel", "info",
-            "-ignore_unknown",
-            "-hwaccel", "cuda",
-            "-hwaccel_output_format", "cuda",
+            "-ignore_unknown"
+        ) + $DecodeArgs + @(
             "-i", $WorkInput,
             "-map", "0:V",
             "-map", "0:a?",
@@ -1138,7 +1252,7 @@ while ($true) {
                 Get-Content -LiteralPath $LogFile -Tail 80 | ForEach-Object { Write-Host $_ }
                 Write-Host "--- end tail ---`n" -ForegroundColor DarkYellow
             }
-            Move-Item -LiteralPath $WorkInput -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+            Move-ItemWithRetry -Source $WorkInput -Destination $File.FullName | Out-Null
             Remove-Item -LiteralPath $TempOut -Force -ErrorAction SilentlyContinue
             continue
         }
@@ -1158,16 +1272,18 @@ while ($true) {
 
         if ((Get-StopRequest) -eq "now") {
             Remove-Item -LiteralPath $TempOut,$RemuxOut -Force -ErrorAction SilentlyContinue
-            Move-Item -LiteralPath $WorkInput -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+            Move-ItemWithRetry -Source $WorkInput -Destination $File.FullName | Out-Null
             continue
         }
 
         # Success: create folder if needed and move
         if (-not $UseFlatMovieOutput) { New-Item -ItemType Directory -Path $MovieDir -Force | Out-Null }
-        Move-Item -LiteralPath $CompletedTempOut -Destination $FinalOut -Force
+        Move-Item -LiteralPath $CompletedTempOut -Destination $FinalOut -Force -ErrorAction Stop
         Remove-Item -LiteralPath $WorkInput -Force -ErrorAction SilentlyContinue
         Remove-EmptyParentFolders -Path $OriginalParent -Stop $SourceDirectory
         Write-StatusLineBreak
         Write-Host "  Done -> $FinalOut" -ForegroundColor Green
     }
 }
+
+Remove-EncoderStatus

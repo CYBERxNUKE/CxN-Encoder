@@ -10,5 +10,5 @@ guiPath = basePath & "\CxN-Encoder-GUI.ps1"
 codec = "x265"
 If WScript.Arguments.Count > 0 Then codec = WScript.Arguments(0)
 
-command = Chr(34) & powershellPath & Chr(34) & " -NoProfile -ExecutionPolicy Bypass -File " & Chr(34) & guiPath & Chr(34) & " -DefaultCodec " & codec & " -HideConsole"
-shell.Run command, 1, False
+command = Chr(34) & powershellPath & Chr(34) & " -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File " & Chr(34) & guiPath & Chr(34) & " -DefaultCodec " & codec & " -HideConsole"
+shell.Run command, 0, False
