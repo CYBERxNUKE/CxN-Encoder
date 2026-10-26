@@ -73,6 +73,7 @@ $script:StopRequestedAt = $null
 $script:StopMode = $null
 $script:IsPaused = $false
 $script:EnginePhase = "Stopped"
+$script:LastFileCompleted = $false
 $script:IdleNoticeShown = $false
 $script:StartedAt = $null
 $script:AllowExit = $false
@@ -82,9 +83,39 @@ $script:MaxLogCharacters = 200000
 $script:LastPendingFlashAt = [datetime]::MinValue
 
 $enginePath = Join-Path $PSScriptRoot "CxN-Encoder.ps1"
+$settingsPath = Join-Path $PSScriptRoot "CxN-Encoder-settings.json"
 $guiLogDirectory = Join-Path $PSScriptRoot "_gui-logs"
 $pendingDirectory = "C:\Movies\convert\_pending"
 New-Item -ItemType Directory -Path $guiLogDirectory -Force | Out-Null
+
+$script:DefaultSettings = [pscustomobject]@{
+    MoviesDirectory = "V:\Plex\Shared Movies"
+    LowQualityMoviesDirectory = "U:\Plex\Shared Movies"
+    TvDirectory = "U:\Plex\TV Shows"
+}
+
+function Get-GuiSettings {
+    if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { return $script:DefaultSettings }
+    try {
+        $loaded = Get-Content -LiteralPath $settingsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        foreach ($property in @("MoviesDirectory", "LowQualityMoviesDirectory", "TvDirectory")) {
+            if ([string]::IsNullOrWhiteSpace([string]$loaded.$property)) {
+                $loaded | Add-Member -NotePropertyName $property -NotePropertyValue $script:DefaultSettings.$property -Force
+            }
+        }
+        return $loaded
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "The settings file could not be read. Default locations will be used.`r`n`r`n$($_.Exception.Message)",
+            "CxN-Encoder settings",
+            "OK",
+            "Warning"
+        ) | Out-Null
+        return $script:DefaultSettings
+    }
+}
+
+$script:EncoderSettings = Get-GuiSettings
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "CxN-Encoder Control"
@@ -143,6 +174,12 @@ $clearButton.Text = "Clear Display"
 $clearButton.Location = New-Object System.Drawing.Point(640, 13)
 $clearButton.Size = New-Object System.Drawing.Size(110, 30)
 $topPanel.Controls.Add($clearButton)
+
+$settingsButton = New-Object System.Windows.Forms.Button
+$settingsButton.Text = "Settings"
+$settingsButton.Location = New-Object System.Drawing.Point(760, 13)
+$settingsButton.Size = New-Object System.Drawing.Size(92, 30)
+$topPanel.Controls.Add($settingsButton)
 
 $statusPanel = New-Object System.Windows.Forms.TableLayoutPanel
 $statusPanel.Dock = "Top"
@@ -303,6 +340,7 @@ function Add-GuiLog {
     if ($regexMatches.Count -gt 0) {
         $currentValue.Text = $regexMatches[$regexMatches.Count - 1].Groups[1].Value
         $script:EnginePhase = "Encoding"
+        $script:LastFileCompleted = $false
         $script:IdleNoticeShown = $false
     }
 
@@ -316,8 +354,15 @@ function Add-GuiLog {
     if ($regexMatches.Count -gt 0) {
         $destinationValue.Text = $regexMatches[$regexMatches.Count - 1].Groups[1].Value
         $progressBar.Value = 100
-        $progressValue.Text = "Completed current file"
+        $progressValue.Text = "Completed successfully"
         $script:EnginePhase = "Completed"
+        $script:LastFileCompleted = $true
+    }
+
+    $regexMatches = [regex]::Matches($normalized, '(?im)^.*Encoding (?:series|movie)\s*\[[^\]]+\]:\s*100(?:\.0+)?%\s*complete\b')
+    if ($regexMatches.Count -gt 0) {
+        $progressBar.Value = 100
+        $progressValue.Text = "Encoding completed; saving output"
     }
 
     if ($normalized -match '(?im)No media or archives found\. Sleeping') {
@@ -358,6 +403,7 @@ function Set-RunningControl {
     $startButton.Enabled = -not $Running
     $startMenuItem.Enabled = -not $Running
     $codecBox.Enabled = -not $Running
+    $settingsButton.Enabled = -not $Running
     $stopButton.Enabled = $Running
     $pauseButton.Enabled = $Running -and -not $script:StopRequestedAt
     $pauseButton.Text = if ($script:IsPaused) { "Resume" } else { "Pause" }
@@ -429,6 +475,33 @@ function Move-SelectedPendingFile {
     }
 }
 
+function Stop-ExternalEncoderProcess {
+    param([Parameter(Mandatory=$true)][int]$ProcessId)
+
+    try {
+        $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+        $result = & $taskkill /PID $ProcessId /T /F 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw (($result | Out-String).Trim())
+        }
+        Start-Sleep -Milliseconds 750
+        if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
+            throw "Process $ProcessId is still running after termination was requested."
+        }
+        Add-GuiLog "Terminated stale encoder process tree rooted at PID $ProcessId.`r`n"
+        return $true
+    } catch {
+        Add-GuiLog "Unable to terminate encoder process PID $ProcessId`: $($_.Exception.Message)`r`n"
+        [System.Windows.Forms.MessageBox]::Show(
+            "Unable to terminate encoder process PID $ProcessId.`r`n`r`n$($_.Exception.Message)",
+            "CxN-Encoder",
+            "OK",
+            "Error"
+        ) | Out-Null
+        return $false
+    }
+}
+
 function Start-Encoder {
     if ($script:EncoderProcess -and -not $script:EncoderProcess.HasExited) { return }
 
@@ -445,14 +518,20 @@ function Start-Encoder {
     if ($otherEncoder) {
         $stateValue.Text = "Another encoder is already running"
         $processValue.Text = "External PID $($otherEncoder.ProcessId)"
-        Add-GuiLog "Start blocked: another encoder process is already running (PID $($otherEncoder.ProcessId)).`r`n"
-        [System.Windows.Forms.MessageBox]::Show(
-            "Another CxN-Encoder process is already running (PID $($otherEncoder.ProcessId)). Stop it before starting a GUI-controlled encoder.",
+        Add-GuiLog "Another encoder process detected (PID $($otherEncoder.ProcessId)).`r`n"
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "Another CxN-Encoder process is already running (PID $($otherEncoder.ProcessId)).`r`n`r`nTerminate that process tree and start a new encoder?",
             "CxN-Encoder",
-            "OK",
+            "YesNo",
             "Warning"
-        ) | Out-Null
-        return
+        )
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+            Add-GuiLog "Start cancelled; existing encoder process was left running.`r`n"
+            return
+        }
+        if (-not (Stop-ExternalEncoderProcess -ProcessId ([int]$otherEncoder.ProcessId))) {
+            return
+        }
     }
 
     Close-LogReader
@@ -482,6 +561,7 @@ function Start-Encoder {
         $script:StopMode = $null
         $script:IsPaused = $false
         $script:EnginePhase = "Starting"
+        $script:LastFileCompleted = $false
         $script:OutputPath = $outputPath
         $script:ErrorPath = $errorPath
         $script:CurrentEncoderLog = $null
@@ -557,6 +637,126 @@ function Show-MainWindow {
     $form.Activate()
 }
 
+function Show-SettingsDialog {
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "CxN-Encoder Settings"
+    $dialog.Size = New-Object System.Drawing.Size(760, 250)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(700, 250)
+    $dialog.StartPosition = "CenterParent"
+    $dialog.FormBorderStyle = "FixedDialog"
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+
+    $layout = New-Object System.Windows.Forms.TableLayoutPanel
+    $layout.Dock = "Fill"
+    $layout.Padding = New-Object System.Windows.Forms.Padding(12)
+    $layout.ColumnCount = 3
+    $layout.RowCount = 5
+    [void]$layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 175)))
+    [void]$layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 90)))
+    $dialog.Controls.Add($layout)
+
+    $fields = @{}
+    $rows = @(
+        @("Movies end location:", "MoviesDirectory"),
+        @("Low-quality movies:", "LowQualityMoviesDirectory"),
+        @("TV end location:", "TvDirectory")
+    )
+    for ($row = 0; $row -lt $rows.Count; $row++) {
+        $caption = New-Object System.Windows.Forms.Label
+        $caption.Text = $rows[$row][0]
+        $caption.Anchor = "Left"
+        $caption.AutoSize = $true
+        $layout.Controls.Add($caption, 0, $row)
+
+        $field = New-Object System.Windows.Forms.TextBox
+        $field.Text = [string]$script:EncoderSettings.($rows[$row][1])
+        $field.Dock = "Fill"
+        $fields[$rows[$row][1]] = $field
+        $layout.Controls.Add($field, 1, $row)
+
+        $browse = New-Object System.Windows.Forms.Button
+        $browse.Text = "Browse..."
+        $browse.Tag = $field
+        $browse.Width = 82
+        $browse.Add_Click({
+            $folder = New-Object System.Windows.Forms.FolderBrowserDialog
+            $folder.Description = "Choose an end location"
+            $folder.ShowNewFolderButton = $true
+            try {
+                if ($folder.ShowDialog($dialog) -eq [System.Windows.Forms.DialogResult]::OK) {
+                    $sender = [System.Windows.Forms.Button]$this
+                    $sender.Tag.Text = $folder.SelectedPath
+                }
+            } finally {
+                $folder.Dispose()
+            }
+        })
+        $layout.Controls.Add($browse, 2, $row)
+    }
+
+    $note = New-Object System.Windows.Forms.Label
+    $note.Text = "Changes apply the next time the encoder is started."
+    $note.AutoSize = $true
+    $note.ForeColor = [System.Drawing.Color]::DimGray
+    $layout.Controls.Add($note, 0, 3)
+    $layout.SetColumnSpan($note, 3)
+
+    $buttons = New-Object System.Windows.Forms.FlowLayoutPanel
+    $buttons.FlowDirection = "RightToLeft"
+    $buttons.Dock = "Fill"
+    $buttons.AutoSize = $true
+    $layout.Controls.Add($buttons, 0, 4)
+    $layout.SetColumnSpan($buttons, 3)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = "Cancel"
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $buttons.Controls.Add($cancel)
+
+    $save = New-Object System.Windows.Forms.Button
+    $save.Text = "Save"
+    $save.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $buttons.Controls.Add($save)
+    $dialog.AcceptButton = $save
+    $dialog.CancelButton = $cancel
+
+    if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) {
+        $dialog.Dispose()
+        return
+    }
+
+    foreach ($property in $fields.Keys) {
+        if ([string]::IsNullOrWhiteSpace($fields[$property].Text)) {
+            [System.Windows.Forms.MessageBox]::Show("All end locations are required.", "CxN-Encoder settings", "OK", "Warning") | Out-Null
+            $dialog.Dispose()
+            return
+        }
+    }
+
+    $newSettings = [ordered]@{
+        MoviesDirectory = $fields.MoviesDirectory.Text.Trim()
+        LowQualityMoviesDirectory = $fields.LowQualityMoviesDirectory.Text.Trim()
+        TvDirectory = $fields.TvDirectory.Text.Trim()
+    }
+    try {
+        $json = $newSettings | ConvertTo-Json
+        Set-Content -LiteralPath $settingsPath -Value $json -Encoding ASCII -ErrorAction Stop
+        $script:EncoderSettings = [pscustomobject]$newSettings
+        Add-GuiLog "Settings saved. New end locations will apply on the next start.`r`n"
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Unable to save settings:`r`n$($_.Exception.Message)",
+            "CxN-Encoder settings",
+            "OK",
+            "Error"
+        ) | Out-Null
+    } finally {
+        $dialog.Dispose()
+    }
+}
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 500
 $timer.Add_Tick({
@@ -582,7 +782,7 @@ $timer.Add_Tick({
             else { "Running - elapsed $($elapsed.ToString('hh\:mm\:ss'))" }
         }
 
-        if ($script:StopRequestedAt -and (((Get-Date) - $script:StopRequestedAt).TotalSeconds -gt 30)) {
+        if ($script:StopRequestedAt -and $script:StopMode -eq "now" -and (((Get-Date) - $script:StopRequestedAt).TotalSeconds -gt 30)) {
             Add-GuiLog "Safe stop timed out; terminating the process tree.`r`n"
             Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" -ArgumentList @('/PID', $script:EncoderProcess.Id, '/T', '/F') -WindowStyle Hidden -Wait
         }
@@ -592,6 +792,8 @@ $timer.Add_Tick({
     if ($script:OutputReader) { Add-GuiLog -Text $script:OutputReader.ReadToEnd() }
     if ($script:ErrorReader) { Add-GuiLog -Text $script:ErrorReader.ReadToEnd() }
     $exitCode = $script:EncoderProcess.ExitCode
+    $wasStopRequested = [bool]$script:StopRequestedAt
+    $wasEncoding = $script:EnginePhase -eq "Encoding"
     Close-LogReader
     Remove-Item -LiteralPath $script:StopSignalPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $script:PauseSignalPath -Force -ErrorAction SilentlyContinue
@@ -603,6 +805,15 @@ $timer.Add_Tick({
     $script:StopRequestedAt = $null
     $script:StopMode = $null
     $script:IsPaused = $false
+    if ($script:LastFileCompleted) {
+        $stateValue.Text = "Completed and stopped"
+        $progressBar.Value = 100
+        $progressValue.Text = "Completed successfully; encoder stopped"
+    } elseif ($wasStopRequested -and $wasEncoding) {
+        $stateValue.Text = "Stopped before completion"
+        $progressBar.Value = 0
+        $progressValue.Text = "Current file did not complete"
+    }
     $script:EnginePhase = "Stopped"
 
     if ($script:ExitWhenStopped) {
@@ -618,6 +829,7 @@ $stopButton.Add_Click({ Stop-Encoder })
 $stopMenuItem.Add_Click({ Stop-Encoder })
 $pauseButton.Add_Click({ Switch-Pause })
 $clearButton.Add_Click({ $logBox.Clear() })
+$settingsButton.Add_Click({ Show-SettingsDialog })
 $refreshPendingButton.Add_Click({ Sync-PendingList | Out-Null })
 $choosePendingButton.Add_Click({ Move-SelectedPendingFile })
 $openPendingButton.Add_Click({

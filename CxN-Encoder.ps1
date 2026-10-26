@@ -60,10 +60,12 @@ $WorkDirectory   = Join-Path $TargetDirectory "_work"
 $LogDirectory    = Join-Path $TargetDirectory "_logs"
 $StatusDirectory  = Join-Path $TargetDirectory "_status"
 $PendingDirectory = Join-Path $TargetDirectory "_pending"
+$RecoveryDirectory = Join-Path $TargetDirectory "_recovery"
 $StatusFile       = Join-Path $StatusDirectory ("CxN-{0}.json" -f $Codec)
 $PlexMoviesDir   = "V:\Plex\Shared Movies"
 $LowQualityMoviesDir = "U:\Plex\Shared Movies"
 $PlexTVDir       = "U:\Plex\TV Shows"
+$SettingsFile    = Join-Path $PSScriptRoot "CxN-Encoder-settings.json"
 $CheckInterval   = 120
 $FFmpegDecodeThreads = 0
 $ExtraHWFrames   = 0
@@ -71,10 +73,41 @@ $MoveRetryDelaySeconds = 10
 $MoveRetryAttempts = 2
 $CustomTag       = "-CxN"
 $MovieExtensions = ".mkv",".mp4",".avi",".mov",".wmv",".flv",".webm",".m4v",".3gp",".ogv",".mpg",".mpeg",".ts",".mts"
+$script:BlockedOutputRoots = @{}
 
 # Movie-only smart skip thresholds
 $MaxGBPerHour = 1.6
 $MaxVideoKbps = 4200
+
+function Get-EncoderSettings {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $defaults = [pscustomobject]@{
+        MoviesDirectory = "V:\Plex\Shared Movies"
+        LowQualityMoviesDirectory = "U:\Plex\Shared Movies"
+        TvDirectory = "U:\Plex\TV Shows"
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $defaults }
+
+    try {
+        $loaded = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        foreach ($property in @("MoviesDirectory", "LowQualityMoviesDirectory", "TvDirectory")) {
+            if ([string]::IsNullOrWhiteSpace([string]$loaded.$property)) {
+                $loaded | Add-Member -NotePropertyName $property -NotePropertyValue $defaults.$property -Force
+            }
+        }
+        return $loaded
+    } catch {
+        Write-Host "Unable to read settings file. Using default end locations: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $defaults
+    }
+}
+
+$EncoderSettings = Get-EncoderSettings -Path $SettingsFile
+$PlexMoviesDir = [string]$EncoderSettings.MoviesDirectory
+$LowQualityMoviesDir = [string]$EncoderSettings.LowQualityMoviesDirectory
+$PlexTVDir = [string]$EncoderSettings.TvDirectory
 
 $DecodeArgs = if ($UseCudaDecode) {
     @(
@@ -226,7 +259,7 @@ $script:MKVMergeResolutionAttempted = $false
 # --- ENSURE DIRS ---
 foreach ($p in @(
     $SourceDirectory,$TargetDirectory,$WorkDirectory,
-    $LogDirectory,$StatusDirectory,$PendingDirectory,
+    $LogDirectory,$StatusDirectory,$PendingDirectory,$RecoveryDirectory,
     $PlexMoviesDir,$LowQualityMoviesDir,$PlexTVDir
 )) {
     if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p | Out-Null }
@@ -328,7 +361,7 @@ function Wait-ForNextCheck {
 }
 function Test-LowQualityMovieFile {
     param([Parameter(Mandatory=$true)][string]$Name)
-    return ($Name -match '(?i)(?:^|[.\s_-])(screener|cam|hdcam|camhd|ts|telesync)(?:[.\s_-]|$)')
+    return ($Name -match '(?i)(?:^|[.\s_-])(screener|cam|hdcam|camhd|HDTC|TC|ts|telesync)(?:[.\s_-]|$)')
 }
 function Test-ConfidentMovieFile {
     param([Parameter(Mandatory=$true)][string]$Name)
@@ -373,8 +406,83 @@ function Get-TaggedBaseName {
     param([Parameter(Mandatory=$true)][string]$Base)
     $normalized = ($Base -replace '(?i)(^|[.\s_-])(?:h|x)(?:\.?)26[45](?=$|[.\s_-])', "`${1}$Codec")
     if ($normalized -match [regex]::Escape($CustomTag) + '$') { return $normalized }
-    $clean = $normalized.Trim()
+    $clean = ($normalized -replace '(-[^\-]*)$','').Trim()
+    if ([string]::IsNullOrWhiteSpace($clean)) { $clean = $normalized }
     return ($clean + $CustomTag)
+}
+function Convert-ToNameToken {
+    param([Parameter(Mandatory=$true)][string]$Value)
+    $value = ($Value -replace '[^A-Za-z0-9]+', ' ').Trim()
+    return (($value -split '\s+' | Where-Object { $_ }) -join '.')
+}
+function Get-SourceNameTag {
+    param([Parameter(Mandatory=$true)][string]$Base)
+    $patterns = @(
+        @{ Pattern = '(?i)(?<![A-Za-z])(WEB[-. ]?Rip)(?![A-Za-z])'; Tag = 'WEBRip' },
+        @{ Pattern = '(?i)(?<![A-Za-z])(WEB[-. ]?DL)(?![A-Za-z])'; Tag = 'WEBDL' },
+        @{ Pattern = '(?i)(?<![A-Za-z])(Blu[-. ]?Ray|BDRip|BRRip)(?![A-Za-z])'; Tag = 'BluRay' },
+        @{ Pattern = '(?i)(?<![A-Za-z])(Remux)(?![A-Za-z])'; Tag = 'Remux' },
+        @{ Pattern = '(?i)(?<![A-Za-z])(HDTV)(?![A-Za-z])'; Tag = 'HDTV' },
+        @{ Pattern = '(?i)(?<![A-Za-z])(DVD(?:Rip)?)(?![A-Za-z])'; Tag = 'DVDRip' },
+        @{ Pattern = '(?i)(?<![A-Za-z])(CAM|HDCAM|HDTC|Telesync|TS)(?![A-Za-z])'; Tag = 'CAM' }
+    )
+    foreach ($item in $patterns) {
+        if ($Base -match $item.Pattern) { return $item.Tag }
+    }
+    return ''
+}
+function Get-ResolutionTag {
+    param([Parameter(Mandatory=$true)]$Info, [Parameter(Mandatory=$true)][string]$Base)
+    if ($Info.Height -ge 2000) { return '2160p' }
+    if ($Info.Height -ge 1000) { return '1080p' }
+    if ($Info.Height -ge 650)  { return '720p' }
+    if ($Info.Height -ge 400)  { return '480p' }
+    $match = [regex]::Match($Base, '(?i)(2160p|1080p|720p|576p|480p|4320p)')
+    if ($match.Success) { return $match.Value.ToLowerInvariant() }
+    return ''
+}
+function Get-AudioNameTag {
+    param([Parameter(Mandatory=$true)]$Info)
+    if ([string]::IsNullOrWhiteSpace($Info.AudioCodec)) { return '' }
+    $codecTag = switch ($Info.AudioCodec.ToLowerInvariant()) {
+        'eac3'   { 'DDP' }
+        'ac3'    { 'DD' }
+        'aac'    { 'AAC' }
+        'dts'    { 'DTS' }
+        'truehd' { 'TrueHD' }
+        'flac'   { 'FLAC' }
+        'opus'   { 'Opus' }
+        'vorbis' { 'Vorbis' }
+        'mp3'    { 'MP3' }
+        default  { $Info.AudioCodec.ToUpperInvariant() }
+    }
+    $layout = [string]$Info.AudioLayout
+    if ($layout -match '(?i)7\.1') { return ($codecTag + '7.1') }
+    if ($layout -match '(?i)5\.1|5\.?1') { return ($codecTag + '5.1') }
+    if ($layout -match '(?i)stereo|2\.0|2 channels') { return ($codecTag + '2.0') }
+    if ([int]$Info.AudioChannels -gt 0) { return ($codecTag + [int]$Info.AudioChannels) }
+    return $codecTag
+}
+function Get-StandardMovieBaseName {
+    param([Parameter(Mandatory=$true)][string]$Base, [Parameter(Mandatory=$true)]$Info)
+    $working = ($Base -replace '(?i)(?:-CxN(?: \(\d+\))?)$','')
+    $yearMatch = [regex]::Match($working, '(?<!\d)(19\d{2}|20\d{2})(?!\d)')
+    $titlePart = if ($yearMatch.Success) { $working.Substring(0, $yearMatch.Index) } else { $working }
+    $titlePart = $titlePart -replace '(?i)(?:WEB[-. ]?Rip|WEB[-. ]?DL|Blu[-. ]?Ray|BDRip|BRRip|Remux|HDTV|DVD(?:Rip)?|CAM|HDCAM|HDTC|Telesync|TS)', ' '
+    $titlePart = $titlePart -replace '(?i)(?:2160p|1080p|720p|576p|480p|x264|x265|h264|h265|hevc|avc|aac|eac3|ac3|ddp|dts|truehd|flac|opus)', ' '
+    $title = Convert-ToNameToken -Value $titlePart
+    if ([string]::IsNullOrWhiteSpace($title)) { $title = Convert-ToNameToken -Value $working }
+    $parts = @()
+    if ($title) { $parts += $title }
+    if ($yearMatch.Success) { $parts += $yearMatch.Groups[1].Value }
+    $resolution = Get-ResolutionTag -Info $Info -Base $working
+    if ($resolution) { $parts += $resolution }
+    $source = Get-SourceNameTag -Base $working
+    if ($source) { $parts += $source }
+    $audio = Get-AudioNameTag -Info $Info
+    if ($audio) { $parts += $audio }
+    $parts += $Codec
+    return (($parts -join '.') + $CustomTag)
 }
 function Get-QPForMinutes {
     param([double]$Min)
@@ -385,7 +493,7 @@ function Get-QPForMinutes {
 function Get-MediaInfo {
     param([Parameter(Mandatory=$true)][string]$Path)
 
-    $json = & $FFprobeExe -v error -print_format json -show_format -show_streams -show_entries stream=index,codec_name,codec_type,codec_tag_string,bit_rate,tags "$Path" 2>$null
+    $json = & $FFprobeExe -v error -print_format json -show_format -show_streams -show_entries stream=index,codec_name,codec_type,codec_tag_string,bit_rate,width,height,channels,channel_layout,sample_rate,tags "$Path" 2>$null
     if (-not $json) { return $null }
     try { $o = $json | ConvertFrom-Json } catch { return $null }
 
@@ -396,6 +504,7 @@ function Get-MediaInfo {
     $streams = @($o.streams)
     $v = $streams | Where-Object { $_.codec_type -eq "video" } | Select-Object -First 1
     $codec = if ($v) { [string]$v.codec_name } else { "" }
+    $a = $streams | Where-Object { $_.codec_type -eq "audio" } | Select-Object -First 1
 
     $kbps = 0.0
     if ($v -and $v.bit_rate) {
@@ -442,6 +551,11 @@ function Get-MediaInfo {
         DurationSeconds        = $dur
         Minutes                = [math]::Round($dur / 60, 1)
         Codec                  = $codec
+        Width                  = if ($v.width) { [int]$v.width } else { 0 }
+        Height                 = if ($v.height) { [int]$v.height } else { 0 }
+        AudioCodec             = if ($a) { [string]$a.codec_name } else { '' }
+        AudioChannels          = if ($a.channels) { [int]$a.channels } else { 0 }
+        AudioLayout            = if ($a.channel_layout) { [string]$a.channel_layout } else { '' }
         AvgKbps                = $kbps
         SubtitleCount          = $subtitleCount
         HasWebVTT              = $hasWebVTT
@@ -801,6 +915,121 @@ function Move-ItemWithRetry {
 
     return $false
 }
+function Get-PathFreeBytes {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    try {
+        $qualifier = Split-Path -Path $Path -Qualifier
+        if ([string]::IsNullOrWhiteSpace($qualifier)) { return -1 }
+        $driveName = $qualifier.TrimEnd('\').TrimEnd(':')
+        $drive = Get-PSDrive -Name $driveName -ErrorAction Stop
+        return [int64]$drive.Free
+    } catch {
+        return -1
+    }
+}
+function Test-OutputRootAvailable {
+    param(
+        [Parameter(Mandatory=$true)][string]$Root,
+        [int64]$RequiredBytes = 0
+    )
+
+    if (-not $script:BlockedOutputRoots.ContainsKey($Root)) { return $true }
+
+    $blocked = $script:BlockedOutputRoots[$Root]
+    $freeBytes = Get-PathFreeBytes -Path $Root
+    if ($freeBytes -ge [int64]$blocked.RequiredBytes) {
+        $script:BlockedOutputRoots.Remove($Root)
+        Write-Host "  Output location has space again; resuming: $Root" -ForegroundColor Green
+        return $true
+    }
+
+    return $false
+}
+function Update-BlockedOutputRoots {
+    foreach ($root in @($script:BlockedOutputRoots.Keys)) {
+        Test-OutputRootAvailable -Root $root | Out-Null
+    }
+}
+function Move-CompletedOutput {
+    param(
+        [Parameter(Mandatory=$true)][string]$Source,
+        [Parameter(Mandatory=$true)][string]$Destination,
+        [Parameter(Mandatory=$true)][string]$RecoveryDestination,
+        [Parameter(Mandatory=$true)][string]$DestinationRoot
+    )
+
+    $destinationExisted = Test-Path -LiteralPath $Destination
+    $sourceBytes = try { [int64](Get-Item -LiteralPath $Source -ErrorAction Stop).Length } catch { 0 }
+    try {
+        Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Host "  Final output move failed: $($_.Exception.Message)" -ForegroundColor Red
+
+        if ($_.Exception.Message -match '(?i)(not enough space|disk full|insufficient disk|there is not enough space)') {
+            $script:BlockedOutputRoots[$DestinationRoot] = [pscustomobject]@{ RequiredBytes = $sourceBytes }
+            Write-Host "  Pausing files for full output location: $DestinationRoot" -ForegroundColor Yellow
+        }
+
+        if (-not $destinationExisted -and (Test-Path -LiteralPath $Destination)) {
+            try {
+                Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
+                Write-Host "  Removed incomplete destination: $Destination" -ForegroundColor Yellow
+            } catch {
+                Write-Host "  Unable to remove incomplete destination: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+
+        if (Test-Path -LiteralPath $Source) {
+            if (Move-ItemWithRetry -Source $Source -Destination $RecoveryDestination) {
+                Write-Host "  Returned source file to: $RecoveryDestination" -ForegroundColor Yellow
+            } else {
+                Write-Host "  WARNING: unable to return source file to: $RecoveryDestination" -ForegroundColor Red
+            }
+        } else {
+            Write-Host "  WARNING: encoded temp file is no longer available for recovery." -ForegroundColor Red
+        }
+
+        return $false
+    }
+}
+function Restore-StaleWorkFiles {
+    $staleFiles = @(Get-ChildItem -LiteralPath $WorkDirectory -File -ErrorAction SilentlyContinue)
+    $temporaryOutputs = @(Get-ChildItem -LiteralPath $TargetDirectory -File -Filter "*.temp.mkv" -ErrorAction SilentlyContinue)
+    if ($staleFiles.Count -eq 0 -and $temporaryOutputs.Count -eq 0) { return }
+
+    $recoveryStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $recoveryRunDirectory = Join-Path $RecoveryDirectory ("startup-" + $recoveryStamp)
+    New-Item -ItemType Directory -Path $recoveryRunDirectory -Force | Out-Null
+
+    foreach ($staleFile in $staleFiles) {
+        $restoreDirectory = $SourceDirectory
+        if (Test-SeriesEpisodeFile -Name $staleFile.Name) {
+            $show = Get-ShowNameFromFilename -Name $staleFile.Name
+            $season = Get-SeasonTag -Name $staleFile.Name
+            $restoreDirectory = Join-Path (Join-Path $SourceDirectory $show) $season
+        }
+
+        $restorePath = Join-Path $restoreDirectory $staleFile.Name
+        if (Test-Path -LiteralPath $restorePath) {
+            $conflictPath = Join-Path $recoveryRunDirectory ("conflict-" + $staleFile.Name)
+            Move-Item -LiteralPath $staleFile.FullName -Destination $conflictPath -Force -ErrorAction Stop
+            Write-Host "  Stale work conflict quarantined: $conflictPath" -ForegroundColor Yellow
+            continue
+        }
+
+        New-Item -ItemType Directory -Path $restoreDirectory -Force | Out-Null
+        Move-Item -LiteralPath $staleFile.FullName -Destination $restorePath -Force -ErrorAction Stop
+        Write-Host "  Restored stale source by filename: $restorePath" -ForegroundColor Yellow
+    }
+
+    foreach ($temporaryOutput in $temporaryOutputs) {
+        $quarantinePath = Join-Path $recoveryRunDirectory $temporaryOutput.Name
+        Move-Item -LiteralPath $temporaryOutput.FullName -Destination $quarantinePath -Force -ErrorAction Stop
+        Write-Host "  Quarantined stale temporary encode: $quarantinePath" -ForegroundColor Yellow
+    }
+}
 function Invoke-FFmpegLogged {
     param(
         [Parameter(Mandatory=$true)][string[]]$Args,
@@ -920,11 +1149,13 @@ function Move-MisclassifiedSeriesEpisodes {
 # ==========================================================
 Write-Host "`n--- $EncoderTitle Service Started (RTX 5080 - Multipass Quality Mode) ---`n" -ForegroundColor Cyan
 
+Restore-StaleWorkFiles
 Move-MisclassifiedSeriesEpisodes -MovieRoots @($PlexMoviesDir, $LowQualityMoviesDir) -TvRoot $PlexTVDir
 
 $script:ZipStabilityState = @{}
 while ($true) {
     $script:EncoderCurrentFile = ""
+    Update-BlockedOutputRoots
     Write-EncoderStatus -State "idle"
     if (Test-StopRequested) {
         Write-StatusLineBreak
@@ -1033,6 +1264,13 @@ while ($true) {
                 Write-StatusLineBreak
                 Write-Host "  Uncertain classification -> pending: $pendingPath" -ForegroundColor Yellow
             }
+            continue
+        }
+
+        $IsLowQualityMovie = if ($IsSeries) { $false } else { Test-LowQualityMovieFile -Name $File.BaseName }
+        $OutputRoot = if ($IsSeries) { $PlexTVDir } elseif ($IsLowQualityMovie) { $LowQualityMoviesDir } else { $PlexMoviesDir }
+        if (-not (Test-OutputRootAvailable -Root $OutputRoot)) {
+            Write-Host "  Skipping file because its output location is full: $OutputRoot" -ForegroundColor Yellow
             continue
         }
 
@@ -1150,11 +1388,15 @@ while ($true) {
 
             # Success: create folder if needed and move
             New-Item -ItemType Directory -Path $FinalSeasonDir -Force | Out-Null
-            Move-Item -LiteralPath $CompletedTempOut -Destination $FinalOut -Force -ErrorAction Stop
+            if (-not (Move-CompletedOutput -Source $CompletedTempOut -Destination $FinalOut -RecoveryDestination $File.FullName -DestinationRoot $PlexTVDir)) {
+                Remove-Item -LiteralPath $TempOut,$RemuxOut -Force -ErrorAction SilentlyContinue
+                continue
+            }
             Remove-Item -LiteralPath $WorkInput -Force -ErrorAction SilentlyContinue
             Remove-EmptyParentFolders -Path $OriginalParent -Stop $SourceDirectory
             Write-StatusLineBreak
             Write-Host "  Done -> $FinalOut" -ForegroundColor Green
+            Update-BlockedOutputRoots
             try { Invoke-Item $FinalSeasonDir } catch {}
             continue
         }
@@ -1162,8 +1404,12 @@ while ($true) {
         # ==================================================
         # MOVIES
         # ==================================================
-        $TaggedBase = Get-TaggedBaseName -Base $File.BaseName
-        $MovieRootDir = if (Test-LowQualityMovieFile -Name $File.BaseName) { $LowQualityMoviesDir } else { $PlexMoviesDir }
+        $TaggedBase = Get-StandardMovieBaseName -Base $File.BaseName -Info $Info
+        $MovieRootDir = if ($IsLowQualityMovie) { $LowQualityMoviesDir } else { $PlexMoviesDir }
+        if (-not (Test-OutputRootAvailable -Root $MovieRootDir)) {
+            Write-Host "  Skipping file because its output location is full: $MovieRootDir" -ForegroundColor Yellow
+            continue
+        }
         if ($MovieRootDir -eq $LowQualityMoviesDir) {
             Write-Host "  Low-quality source tag detected -> routing to: $LowQualityMoviesDir" -ForegroundColor DarkYellow
         }
@@ -1198,10 +1444,13 @@ while ($true) {
         if (Test-AlreadyCompressed -Path $WorkInput -Info $Info) {
             Write-Host "  MOVIE already compressed -> moving as-is" -ForegroundColor Magenta
             if (-not $UseFlatMovieOutput) { New-Item -ItemType Directory -Path $MovieDir -Force | Out-Null }
-            Move-Item -LiteralPath $WorkInput -Destination $AsIsMovieOut -Force -ErrorAction Stop
+            if (-not (Move-CompletedOutput -Source $WorkInput -Destination $AsIsMovieOut -RecoveryDestination $File.FullName -DestinationRoot $MovieRootDir)) {
+                continue
+            }
             Remove-EmptyParentFolders -Path $OriginalParent -Stop $SourceDirectory
             Write-StatusLineBreak
             Write-Host "  Done -> $AsIsMovieOut" -ForegroundColor Green
+            Update-BlockedOutputRoots
             continue
         }
 
@@ -1278,11 +1527,15 @@ while ($true) {
 
         # Success: create folder if needed and move
         if (-not $UseFlatMovieOutput) { New-Item -ItemType Directory -Path $MovieDir -Force | Out-Null }
-        Move-Item -LiteralPath $CompletedTempOut -Destination $FinalOut -Force -ErrorAction Stop
+        if (-not (Move-CompletedOutput -Source $CompletedTempOut -Destination $FinalOut -RecoveryDestination $File.FullName -DestinationRoot $MovieRootDir)) {
+            Remove-Item -LiteralPath $TempOut,$RemuxOut -Force -ErrorAction SilentlyContinue
+            continue
+        }
         Remove-Item -LiteralPath $WorkInput -Force -ErrorAction SilentlyContinue
         Remove-EmptyParentFolders -Path $OriginalParent -Stop $SourceDirectory
         Write-StatusLineBreak
         Write-Host "  Done -> $FinalOut" -ForegroundColor Green
+        Update-BlockedOutputRoots
     }
 }
 
